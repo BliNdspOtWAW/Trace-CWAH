@@ -1,0 +1,23 @@
+{
+  "experiment": "CWAH baseline task26",
+  "timestamp": null,
+  "trace_enabled": false,
+  "task_id": 26,
+  "task_name": "prepare_food",
+  "dataset_index": null,
+  "dataset_sha256": null,
+  "clusters": [17, 24, 8, 23],
+  "target_agent_id": 1,
+  "teammate_agent_id": 2,
+  "target_model": "deepseek-ai/DeepSeek-V3.1",
+  "teammate_model": "deepseek-ai/DeepSeek-V3.1",
+  "api_endpoint_label": null,
+  "temperature": 0,
+  "max_tokens": 1024,
+  "num_runs_per_cluster": 1,
+  "observation_type": "partial",
+  "max_episode_length": 250,
+  "communication": true,
+  "code_commit": null,
+  "virtualhome_commit": null
+}

@@ -1,0 +1,5 @@
+# Real run artifacts stay local; only the layout and template are versioned.
+/config_*.json
+/summary_*.csv
+/cluster_*/*
+!/cluster_*/.gitkeep

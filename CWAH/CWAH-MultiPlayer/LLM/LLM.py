@@ -66,7 +66,7 @@ class LLM:
         if self.agent_id == 1:
             role_prefix = "CWAH_AGENT"
         elif self.agent_id == 2:
-            role_prefix = "CWAH_Human"
+            role_prefix = "CWAH_HUMAN"
 
         def _get_env(suffix: str):
             if not role_prefix:
