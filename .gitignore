@@ -1,0 +1,55 @@
+# Python and local development
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+
+# Secrets and machine-local configuration
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.template
+**/env.local.sh
+*.pem
+*.key
+
+# TRACE-local audit backups
+.git-nested-backups/
+
+# EntCollabBench generated/runtime data
+EntCollabBench/Arena/mcp-gitea/
+EntCollabBench/scripts/result/
+EntCollabBench/scripts/dataset/
+EntCollabBench/scripts/.env
+
+# CWAH / VirtualHome external and generated artifacts
+CWAH/virtualhome/
+CWAH/executable/
+CWAH/executable.zip
+CWAH/**/logs/
+CWAH/**/logs_*/
+CWAH/**/record/
+CWAH/**/checkpoints/
+CWAH/**/trained_models/
+CWAH/**/test_results/
+CWAH/**/logdir/
+CWAH/**/*.pkl
+CWAH/**/*.pik
+CWAH/**/*.pth
+CWAH/**/*.mp4
+CWAH/**/*.png
+CWAH/**/*.jpg
+CWAH/**/*.zip
+
+# Common experiment outputs
+results/
+outputs/
+wandb/
+runs/
