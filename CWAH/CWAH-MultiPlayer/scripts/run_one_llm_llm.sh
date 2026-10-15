@@ -50,7 +50,6 @@ TEMP="${TEMP:-1.0}"
 
 EXECUTABLE_FILE="${EXECUTABLE_FILE:-${ROOT}/../executable/linux_exec.v2.3.0.x86_64}"
 DATASET_PATH="${DATASET_PATH:-${ROOT}/dataset/test_env_set_help.pik}"
-PROMPT_TEMPLATE_PATH="${PROMPT_TEMPLATE_PATH:-LLM/prompt_Agent.txt}"
 
 DEBUG_FLAG="${DEBUG_FLAG:---debug}"
 
@@ -73,7 +72,6 @@ fi
 
 "${PYTHON_BIN}" testing_agents/test_symbolic_LLMs.py \
   --communication \
-  --prompt_template_path "${PROMPT_TEMPLATE_PATH}" \
   --mode "${MODE}" \
   --record_dir "${RECORD_DIR}" \
   --dataset_path "${DATASET_PATH}" \

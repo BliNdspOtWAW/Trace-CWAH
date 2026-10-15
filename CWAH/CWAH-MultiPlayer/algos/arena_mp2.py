@@ -29,6 +29,7 @@ class ArenaMP(object):
         self.max_episode_length = self.env.max_episode_length
         self.max_number_steps = max_number_steps
         self.run_predefined_actions = run_predefined_actions
+        self.last_communication_events = []
         atexit.register(self.close)
 
     def close(self):
@@ -39,6 +40,7 @@ class ArenaMP(object):
 
 
     def reset(self, task_id=None, task = None):
+        self.last_communication_events = []
         self.cnt_duplicate_subgoal = 0
         self.cnt_nouse_subgoal = 0
         if self.run_predefined_actions:
@@ -380,7 +382,60 @@ class ArenaMP(object):
         except Exception as e:
             print("Exception occurs when performing action: ", dict_actions)
             raise Exception
+        self.last_communication_events = self.process_messages(step_info[4], step_info[2])
         return step_info, dict_actions, dict_info
+
+    def process_messages(self, messages, done=False):
+        """Deliver active messages and at most one free reply per active message."""
+        events = []
+        active = []
+        step = self.env.steps - 1
+        for sender, message in enumerate(messages):
+            if message is None or not message.strip():
+                continue
+            event = {
+                "step": step, "kind": "active", "sender": sender,
+                "receiver": 1 - sender, "text": message,
+            }
+            active.append(event)
+            events.append(event)
+            for agent in self.agents:
+                if hasattr(agent, "receive_dialogue_event"):
+                    agent.receive_dialogue_event(event)
+
+        if done or not active:
+            return events
+        observations = self.env.get_observations()
+        for parent in active:
+            receiver = parent["receiver"]
+            agent = self.agents[receiver]
+            if not hasattr(agent, "reply_to_message"):
+                continue
+            try:
+                reply, call = agent.reply_to_message(parent["text"], observations[receiver])
+            except Exception as exc:
+                events.append({
+                    "step": step, "kind": "reply_error", "sender": receiver,
+                    "receiver": parent["sender"], "parent_sender": parent["sender"],
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            events.append({
+                "step": step, "kind": "reply_call", "sender": receiver,
+                "receiver": parent["sender"], "parent_sender": parent["sender"],
+                "call": call,
+            })
+            if reply:
+                event = {
+                    "step": step, "kind": "reply", "sender": receiver,
+                    "receiver": parent["sender"], "parent_sender": parent["sender"],
+                    "text": reply,
+                }
+                events.append(event)
+                for peer in self.agents:
+                    if hasattr(peer, "receive_dialogue_event"):
+                        peer.receive_dialogue_event(event)
+        return events
 
     def run(self, random_goal=False, pred_goal=None, cnt_subgoal_info = False):
         """
@@ -414,11 +469,26 @@ class ArenaMP(object):
                       'graph': {0: [], 1: []},
                       'progress': [],
                       'state_back':{0:[],1:[],2:[]},
+                      'communication_events': [],
+                      'communication_calls': 0,
+                      'communication_calls_with_reported_usage': 0,
+                      'communication_token_usage': {
+                          'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0
+                      },
                       
                     }
         success = False
         while True:
             (obs, reward, done, infos, messages), actions, agent_info = self.step()
+            saved_info['communication_events'].extend(self.last_communication_events)
+            for event in self.last_communication_events:
+                if event['kind'] == 'reply_call':
+                    saved_info['communication_calls'] += 1
+                    usage = event['call'].get('usage') or {}
+                    if any(isinstance(usage.get(key), (int, float)) for key in saved_info['communication_token_usage']):
+                        saved_info['communication_calls_with_reported_usage'] += 1
+                    for key in saved_info['communication_token_usage']:
+                        saved_info['communication_token_usage'][key] += usage.get(key) or 0
             success = infos['finished']
             # if infos['failed_exec']:
             #     raise ValueError(infos)

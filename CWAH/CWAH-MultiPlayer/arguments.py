@@ -140,7 +140,7 @@ def get_args():
         help='openai API or load huggingface models')
     parser.add_argument('--lm_id', default='facebook/opt-13b',
                         help='name for openai engine or huggingface model name/path')
-    parser.add_argument('--prompt_template_path', default='LLM/prompt_nocom.csv',
+    parser.add_argument('--prompt_template_path', default='LLM/prompt_Peer.txt',
                         help='path to prompt template file')
     parser.add_argument("--t", default=0, type=float)
     parser.add_argument("--top_p", default=1.0, type=float)

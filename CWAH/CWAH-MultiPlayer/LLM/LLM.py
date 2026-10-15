@@ -17,6 +17,24 @@ for _, row in df.iterrows():
     profile_dict[key] = row['Profile']
     examples_dict[key] = []
 
+
+def resolve_profile_key(task):
+    """Optionally reuse a profile on another task without changing task data."""
+    source = os.getenv("CWAH_PROFILE_SOURCE_TASK")
+    expected = os.getenv("CWAH_PROFILE_EXPECTED_TASK")
+    if not source and not expected:
+        return task
+    if not source or not expected:
+        raise ValueError("Both CWAH_PROFILE_SOURCE_TASK and CWAH_PROFILE_EXPECTED_TASK are required")
+    actual, separator, cluster = task.rpartition("_")
+    if not separator or actual != expected or not cluster:
+        raise ValueError(f"Profile override expects {expected}_<cluster>, got {task}")
+    key = f"{source}_{cluster}"
+    if key not in profile_dict:
+        raise ValueError(f"Missing profile for {key}")
+    return key
+
+
 class LLM:
     def __init__(self,
                  source,  # 'huggingface' or 'openai'
@@ -38,25 +56,16 @@ class LLM:
         self.goal_location_id = None
         self.roomname2id = {}
         self.rooms = []
-        self.prompt_template_path = prompt_template_path
-        self.single = 'single' in self.prompt_template_path
+        self.prompt_template_path = os.path.join(os.path.dirname(__file__), 'prompt_Peer.txt')
+        self.single = False
         self.act = sampling_parameters.act
         self.big_5_act = sampling_parameters.big_5
         self.personality = None
 
-        # 读取主prompt模板为字符串
-        # 本项目约定：index0/human, index1/agent
-        # 对应到 Unity 的 character id：agent_id=1 视为 human，agent_id=2 视为 agent
-        if self.agent_id == 1:
-            # with open('LLM/prompt_Agent.txt', 'r', encoding='utf-8') as f:
-            #     self.prompt_template = f.read()
-            with open('LLM/prompt_Agent.txt', 'r', encoding='utf-8') as f:
-                self.prompt_template = f.read()
-            self.prompt_template = self.prompt_template.replace("$AGENT_NAME", self.agent_name).replace("$OPPO_NAME", self.oppo_name)
-        else:
-            with open('LLM/prompt_Human.txt', 'r', encoding='utf-8') as f:
-                self.prompt_template = f.read()
-            self.prompt_template = self.prompt_template.replace("$AGENT_NAME", self.agent_name).replace("$OPPO_NAME", self.oppo_name).replace("{AGENT_NAME}", self.agent_name).replace("{OPPO_NAME}", self.oppo_name)
+        # Both players use the same peer policy; only Bob receives a profile.
+        with open(self.prompt_template_path, 'r', encoding='utf-8') as f:
+            self.prompt_template = f.read()
+        self.prompt_template = self.prompt_template.replace("$AGENT_NAME", self.agent_name).replace("$OPPO_NAME", self.oppo_name)
 
         self.communication = communication
         self.cot = cot
@@ -97,6 +106,7 @@ class LLM:
         )
         self.OPENAI_KEY = None
         self.total_cost = 0
+        self.last_usage_metadata = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.source == 'openai':
             if self.api_key is not None:
@@ -155,6 +165,7 @@ class LLM:
             @backoff.on_exception(backoff.expo, OpenAIError)
             def _generate(prompt, sampling_params):
                 usage = 0
+                self.last_usage_metadata = None
                 if source == 'openai':
                     try:
                         if self.chat:
@@ -167,6 +178,11 @@ class LLM:
                                 model=self.lm_id, messages=prompt, **sampling_params
                             )
                             generated_samples = [response['choices'][i]['message']['content'] for i in range(sampling_params['n'])]
+                            response_usage = response.get('usage') or {}
+                            self.last_usage_metadata = {
+                                key: response_usage.get(key)
+                                for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                            }
                             if 'gpt-4' in self.lm_id:
                                 usage = response['usage']['prompt_tokens'] * 0.03 / 1000 + response['usage']['completion_tokens'] * 0.06 / 1000
                             elif 'gpt-3.5' in self.lm_id:
@@ -206,7 +222,10 @@ class LLM:
             if self.agent_id == 1:
                 self.personality = ""
             else:
-                self.personality = profile_dict.get(self.task, "")
+                profile_key = resolve_profile_key(self.task)
+                self.personality = profile_dict.get(profile_key, "")
+                if profile_key != self.task:
+                    print(f"[LLM] teammate profile: {self.task} -> {profile_key}")
                 
         else:
             self.personality = ""
@@ -506,13 +525,12 @@ class LLM:
         info = {}
         progress_desc = self.progress2text(current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored)
         action_history_desc = ", ".join(action_history[-10:] if len(action_history) > 10 else action_history)
-        dialogue_history_desc = '\n'.join(dialogue_history[-3:] if len(dialogue_history) > 3 else dialogue_history)
+        dialogue_history_desc = '\n'.join(dialogue_history) or 'None'
         prompt = self.prompt_template.replace('$GOAL', self.goal_desc)
         prompt = prompt.replace('$PROGRESS', progress_desc)
         prompt = prompt.replace('$STEP', str(steps))
         prompt = prompt.replace('$ACTION_HISTORY', action_history_desc)
-        if self.personality is not None:
-            prompt = prompt.replace('$ASSIGNED_PERSONALITY', self.personality)
+        prompt = prompt.replace('$ASSIGNED_PERSONALITY', self.personality or 'None')
         prompt = prompt.replace('$DIALOGUE_HISTORY', dialogue_history_desc)
         available_plans, available_plans_refine, available_plans_list, available_plans_list_refine, num = self.get_available_plans(location, grabbed_objects, unchecked_containers, ungrabbed_objects, None, room_explored)
         if num == 0:
@@ -533,6 +551,7 @@ class LLM:
         info["raw_output"] = output
         info["raw_outputs"] = outputs
         info["raw_usage"] = usage
+        info["token_usage"] = self.last_usage_metadata
         if self.debug:
             print(f"output:\n{output}")
             print(f"total cost: {self.total_cost}")

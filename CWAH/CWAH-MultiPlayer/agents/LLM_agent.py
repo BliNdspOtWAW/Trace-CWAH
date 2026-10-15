@@ -1,4 +1,5 @@
 from LLM import *
+from LLM.communication import CommunicationModule
 
 
 class LLM_agent:
@@ -18,8 +19,10 @@ class LLM_agent:
 		self.cot = args.cot
 		self.args = args
 		self.LLM = LLM(self.source, self.lm_id, self.prompt_template_path, self.communication, self.cot, self.args, self.agent_id)
+		self.communication_module = CommunicationModule(self.LLM)
 		self.action_history = []
 		self.dialogue_history = []
+		self.dialogue_events = []
 		self.containers_name = []
 		self.goal_objects_name = []
 		self.rooms_name = []
@@ -187,10 +190,8 @@ class LLM_agent:
 		:param goal:{predicate:[count, True, 2]}
 		:return:
 		"""
-		if self.communication:
-			for i in range(len(observation["messages"])):
-				if observation["messages"][i] is not None:
-					self.dialogue_history.append(f"{self.agent_names[i + 1]}: {observation['messages'][i]}")
+		# Arena delivers every active and immediate-reply event exactly once.
+		# Reading observation['messages'] here would duplicate active messages.
 
 		satisfied, unsatisfied = self.check_progress(observation, goal)
 		# print(f"satisfied: {satisfied}")
@@ -317,6 +318,16 @@ class LLM_agent:
 	
 		return action, info
 
+	def receive_dialogue_event(self, event):
+		self.dialogue_events.append(event.copy())
+		self.dialogue_history.append(f"{self.agent_names[event['sender'] + 1]}: {event['text']}")
+
+	def reply_to_message(self, message, observation):
+		room = self.current_room['class_name'] if self.current_room else None
+		return self.communication_module.reply(
+			message, self.dialogue_history, self.plan, room, observation
+		)
+
 	def reset(self, obs, containers_name, goal_objects_name, rooms_name, room_info, goal, task):
 		# containers_name: ['bathroomcabinet', 'kitchencabinet', 'cabinet', 'fridge', 'stove', 'dishwasher', 'microwave']
         # goal_objects_name: ['apple', 'cupcake', 'juice', 'pudding', 'coffeetable']
@@ -356,4 +367,5 @@ class LLM_agent:
 		self.plan = None
 		self.action_history = [f"[goexplore] <{self.current_room['class_name']}> ({self.current_room['id']})"]
 		self.dialogue_history = []
+		self.dialogue_events = []
 		self.LLM.reset(obs,self.rooms_name, self.roomname2id, self.goal_location, self.unsatisfied, task)

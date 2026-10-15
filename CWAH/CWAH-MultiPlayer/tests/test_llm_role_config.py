@@ -5,10 +5,26 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from LLM.LLM import LLM
+from LLM.LLM import LLM, resolve_profile_key
 
 
 class LLMRoleConfigTests(unittest.TestCase):
+    def test_profile_override_uses_real_task_and_source_cluster(self):
+        values = {
+            "CWAH_PROFILE_SOURCE_TASK": "26_prepare_food",
+            "CWAH_PROFILE_EXPECTED_TASK": "50_prepare_food",
+        }
+        with patch.dict(os.environ, values):
+            self.assertEqual(resolve_profile_key("50_prepare_food_17"), "26_prepare_food_17")
+            with self.assertRaises(ValueError):
+                resolve_profile_key("49_prepare_food_17")
+            with self.assertRaises(ValueError):
+                resolve_profile_key("50_prepare_food_99999")
+
+    def test_profile_lookup_is_unchanged_without_override(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(resolve_profile_key("26_prepare_food_17"), "26_prepare_food_17")
+
     def test_agent_and_human_use_separate_settings(self):
         args = SimpleNamespace(
             debug=False,
