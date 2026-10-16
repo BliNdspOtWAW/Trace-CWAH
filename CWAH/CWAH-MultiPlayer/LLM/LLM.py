@@ -56,13 +56,16 @@ class LLM:
         self.goal_location_id = None
         self.roomname2id = {}
         self.rooms = []
-        self.prompt_template_path = os.path.join(os.path.dirname(__file__), 'prompt_Peer.txt')
+        role_prompt = getattr(sampling_parameters,
+                              'alice_prompt_file' if agent_id == 1 else 'bob_prompt_file', None)
+        self.prompt_template_path = role_prompt or os.path.join(os.path.dirname(__file__), 'prompt_Peer.txt')
         self.single = False
         self.act = sampling_parameters.act
         self.big_5_act = sampling_parameters.big_5
+        self.teammate_profile_file = getattr(sampling_parameters, 'teammate_profile_file', None)
         self.personality = None
 
-        # Both players use the same peer policy; only Bob receives a profile.
+        # Both players default to the peer policy; only Bob receives a profile.
         with open(self.prompt_template_path, 'r', encoding='utf-8') as f:
             self.prompt_template = f.read()
         self.prompt_template = self.prompt_template.replace("$AGENT_NAME", self.agent_name).replace("$OPPO_NAME", self.oppo_name)
@@ -217,7 +220,15 @@ class LLM:
         self.roomname2id = roomname2id
         self.goal_location = goal_location
         self.task = task
-        if self.big_5_act is not None:
+        if self.teammate_profile_file is not None:
+            if self.agent_id == 2:
+                with open(self.teammate_profile_file, 'r', encoding='utf-8') as profile_file:
+                    self.personality = profile_file.read().strip()
+                if not self.personality:
+                    raise ValueError(f'Empty teammate profile: {self.teammate_profile_file}')
+            else:
+                self.personality = ''
+        elif self.big_5_act is not None:
           
             if self.agent_id == 1:
                 self.personality = ""
@@ -521,7 +532,7 @@ class LLM:
         
         return plans, plans_refine, available_plans, available_plans_refine, len(available_plans)
 
-    def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers, ungrabbed_objects, goal_location_room, action_history, dialogue_history, opponent_grabbed_objects, opponent_last_room, room_explored=None, steps=0):
+    def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers, ungrabbed_objects, goal_location_room, action_history, dialogue_history, opponent_grabbed_objects, opponent_last_room, room_explored=None, steps=0, belief_context=""):
         info = {}
         progress_desc = self.progress2text(current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored)
         action_history_desc = ", ".join(action_history[-10:] if len(action_history) > 10 else action_history)
@@ -532,6 +543,7 @@ class LLM:
         prompt = prompt.replace('$ACTION_HISTORY', action_history_desc)
         prompt = prompt.replace('$ASSIGNED_PERSONALITY', self.personality or 'None')
         prompt = prompt.replace('$DIALOGUE_HISTORY', dialogue_history_desc)
+        prompt = prompt.replace('$TRACE_BELIEF', belief_context)
         available_plans, available_plans_refine, available_plans_list, available_plans_list_refine, num = self.get_available_plans(location, grabbed_objects, unchecked_containers, ungrabbed_objects, None, room_explored)
         if num == 0:
             print("Warning! No available plans!")
@@ -544,6 +556,7 @@ class LLM:
             print(f"prompt:\n{prompt}")
         chat_prompt = [{"role": "user", "content": prompt}]
         info["raw_prompt"] = prompt
+        info["trace_belief_context"] = belief_context
         info["raw_chat_prompt"] = chat_prompt
         outputs, usage = self.generator(chat_prompt if self.chat else prompt, self.sampling_params)
         output = outputs[0]

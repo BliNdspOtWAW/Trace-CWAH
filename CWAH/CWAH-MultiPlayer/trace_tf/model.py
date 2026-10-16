@@ -18,6 +18,9 @@ class EvidenceSource(str, Enum):
     TEAMMATE_MESSAGE = "teammate_message"
     VISIBLE_OBSERVATION = "visible_observation"
     OWN_ACTION_OUTCOME = "own_action_outcome"
+    OWN_MESSAGE = "own_message"
+    OWN_ACTION = "own_action"
+    VISIBLE_PEER_OUTCOME = "visible_peer_outcome"
 
 
 def _json_copy(value: Any) -> Any:

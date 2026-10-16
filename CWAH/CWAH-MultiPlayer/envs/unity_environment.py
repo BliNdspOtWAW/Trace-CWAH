@@ -346,10 +346,10 @@ class UnityEnvironment(BaseUnityEnvironment):
 			success, m = self.comm.expand_scene(updated_graph)
 
 		if not success:
-			ipdb.set_trace()
-			print("Error expanding scene")
-			ipdb.set_trace()
-			return None
+			raise RuntimeError(
+				f"Could not expand VirtualHome scene for task {self.task_id} "
+				f"in environment {self.env_id}: {m}"
+			)
 
 		self.offset_cameras = self.comm.camera_count()[1]
 		if self.init_rooms[0] not in ['kitchen', 'bedroom', 'livingroom', 'bathroom']:

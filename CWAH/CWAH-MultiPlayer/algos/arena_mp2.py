@@ -382,10 +382,15 @@ class ArenaMP(object):
         except Exception as e:
             print("Exception occurs when performing action: ", dict_actions)
             raise Exception
-        self.last_communication_events = self.process_messages(step_info[4], step_info[2])
+        post_step_observations = self.env.get_observations()
+        if self.agents and hasattr(self.agents[0], "observe_trace_outcome"):
+            self.agents[0].observe_trace_outcome(post_step_observations[0], self.env.steps)
+        self.last_communication_events = self.process_messages(
+            step_info[4], step_info[2], observations=post_step_observations
+        )
         return step_info, dict_actions, dict_info
 
-    def process_messages(self, messages, done=False):
+    def process_messages(self, messages, done=False, observations=None):
         """Deliver active messages and at most one free reply per active message."""
         events = []
         active = []
@@ -405,7 +410,8 @@ class ArenaMP(object):
 
         if done or not active:
             return events
-        observations = self.env.get_observations()
+        if observations is None:
+            observations = self.env.get_observations()
         for parent in active:
             receiver = parent["receiver"]
             agent = self.agents[receiver]
@@ -430,6 +436,7 @@ class ArenaMP(object):
                     "step": step, "kind": "reply", "sender": receiver,
                     "receiver": parent["sender"], "parent_sender": parent["sender"],
                     "text": reply,
+                    "intention": call.get("intention"),
                 }
                 events.append(event)
                 for peer in self.agents:
@@ -542,6 +549,20 @@ class ArenaMP(object):
             if done:
                 break
         saved_info['finished'] = success
+        if self.agents and getattr(self.agents[0], "trace", None) is not None:
+            trace = self.agents[0].trace
+            updater_calls = [entry['llm_call'] for entry in trace.update_log if entry['llm_call']]
+            saved_info['trace'] = {
+                "evidence_events": [event.to_dict() for event in trace.ledger.events],
+                "belief_updates": trace.update_log,
+                "final_belief": trace.state.to_dict(),
+                "updater_calls": len(updater_calls),
+                "updater_calls_with_reported_usage": sum(call.get('usage') is not None for call in updater_calls),
+                "updater_token_usage": {
+                    key: sum((call.get('usage') or {}).get(key) or 0 for call in updater_calls)
+                    for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                },
+            }
         if cnt_subgoal_info:
             saved_info['cnt_duplicate_subgoal'] = self.cnt_duplicate_subgoal
             saved_info['cnt_nouse_subgoal'] = self.cnt_nouse_subgoal

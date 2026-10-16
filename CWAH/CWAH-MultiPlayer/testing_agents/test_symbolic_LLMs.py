@@ -120,7 +120,8 @@ if __name__ == '__main__':
             steps = 250
             # try:
 
-            task = f"{env_task_set[episode_id]['task_id']}_{env_task_set[episode_id]['task_name']}_{args.big_5}"
+            task_name = f"{env_task_set[episode_id]['task_id']}_{env_task_set[episode_id]['task_name']}"
+            task = task_name if args.teammate_profile_file else f"{task_name}_{args.big_5}"
 
             arena.reset(episode_id, task)
             

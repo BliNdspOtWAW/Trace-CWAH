@@ -1,5 +1,7 @@
 from LLM import *
 from LLM.communication import CommunicationModule
+from trace_tf.updater import HybridUpdater
+from trace_tf.policy import render_policy_context, render_reply_context
 
 
 class LLM_agent:
@@ -11,6 +13,8 @@ class LLM_agent:
 		self.agent_type = 'LLM'
 		self.agent_names = ["Zero", "Alice", "Bob"]
 		self.agent_id = agent_id
+		if agent_id == 1 and getattr(args, 'trace_mode', 'off') == 'on' and getattr(args, 'obs_type', 'partial') != 'partial':
+			raise ValueError('TRACE target requires partial observations; full/vision observations are not audited')
 		self.opponent_agent_id = 3 - agent_id
 		self.source = args.source
 		self.lm_id = args.lm_id
@@ -23,6 +27,7 @@ class LLM_agent:
 		self.action_history = []
 		self.dialogue_history = []
 		self.dialogue_events = []
+		self.trace = None
 		self.containers_name = []
 		self.goal_objects_name = []
 		self.rooms_name = []
@@ -146,7 +151,11 @@ class LLM_agent:
 		if len(self.grabbed_objects) == 2:
 			return f"[goput] {self.goal_location}", {}
 
-		return self.LLM.run(location, self.current_room, [self.id2node[x] for x in self.grabbed_objects], self.satisfied, self.unchecked_containers, self.ungrabbed_objects, self.id_inside_room[self.goal_location_id], self.action_history, self.dialogue_history, self.opponent_grabbed_objects, self.id_inside_room[self.opponent_agent_id], None, self.steps)
+		context = ""
+		if self.trace is not None:
+			self.trace.update()
+			context = render_policy_context(self.trace.state, self.trace.ledger)
+		return self.LLM.run(location, self.current_room, [self.id2node[x] for x in self.grabbed_objects], self.satisfied, self.unchecked_containers, self.ungrabbed_objects, self.id_inside_room[self.goal_location_id], self.action_history, self.dialogue_history, self.opponent_grabbed_objects, self.id_inside_room[self.opponent_agent_id], None, self.steps, belief_context=context)
 
 
 	def check_progress(self, state, goal_spec):
@@ -192,6 +201,8 @@ class LLM_agent:
 		"""
 		# Arena delivers every active and immediate-reply event exactly once.
 		# Reading observation['messages'] here would duplicate active messages.
+		if self.trace is not None:
+			self.trace.ledger.observe(self.steps, observation)
 
 		satisfied, unsatisfied = self.check_progress(observation, goal)
 		# print(f"satisfied: {satisfied}")
@@ -316,17 +327,49 @@ class LLM_agent:
 				action = f"[walktowards] <{target_room_name}> ({self.roomname2id[target_room_name]})"
 			self.stuck = 0
 	
+		if self.trace is not None:
+			self.trace.ledger.own_action(self.steps - 1, action)
 		return action, info
 
 	def receive_dialogue_event(self, event):
 		self.dialogue_events.append(event.copy())
 		self.dialogue_history.append(f"{self.agent_names[event['sender'] + 1]}: {event['text']}")
+		if self.trace is not None:
+			self.trace.ledger.message(event['step'], event['sender'], event['receiver'], event['text'], event['kind'])
+
+	def observe_trace_outcome(self, observation, step):
+		if self.trace is not None:
+			self.trace.ledger.observe(step, observation)
 
 	def reply_to_message(self, message, observation):
 		room = self.current_room['class_name'] if self.current_room else None
-		return self.communication_module.reply(
-			message, self.dialogue_history, self.plan, room, observation
+		belief_context = "TRACE is disabled. No teammate belief is available."
+		trace_record = None
+		if self.trace is not None:
+			state, trace_record = self.trace.update()
+			belief_context = render_reply_context(state, self.trace.ledger)
+		known_satisfied = [f"<{item['class_name']}> ({item['id']})" for item in self.satisfied]
+		progress = (
+			f"Last selected environment action: {self.last_action or 'None'}\n"
+			f"Known satisfied goal objects: {', '.join(known_satisfied) or 'None'}\n"
+			f"Known remaining goal requirements: {self.unsatisfied or 'Unknown'}"
 		)
+		reply, call = self.communication_module.reply(
+			message, self.dialogue_history, self.plan, room, observation,
+			agent_id=self.agent_id, progress=progress,
+			action_history=self.action_history[-10:], belief_context=belief_context,
+		)
+		call.update({
+			"planner_type": "reactive",
+			"trace_enabled": self.trace is not None,
+			"trace_revision": self.trace.state.revision if self.trace is not None else None,
+			"trace_updated": trace_record is not None,
+			"trace_new_event_ids": trace_record["new_event_ids"] if trace_record else [],
+			"trace_context": belief_context,
+			"current_skill": self.plan,
+			"action_history": self.action_history[-10:],
+		})
+		return reply, call
 
 	def reset(self, obs, containers_name, goal_objects_name, rooms_name, room_info, goal, task):
 		# containers_name: ['bathroomcabinet', 'kitchencabinet', 'cabinet', 'fridge', 'stove', 'dishwasher', 'microwave']
@@ -369,3 +412,4 @@ class LLM_agent:
 		self.dialogue_history = []
 		self.dialogue_events = []
 		self.LLM.reset(obs,self.rooms_name, self.roomname2id, self.goal_location, self.unsatisfied, task)
+		self.trace = HybridUpdater(self.LLM) if self.agent_id == 1 and getattr(self.args, 'trace_mode', 'off') == 'on' else None

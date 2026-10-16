@@ -129,6 +129,14 @@ def get_args():
                         help='enabling role playing')
     parser.add_argument('--big_5', type=str, default=None,
                         help='enabling big 5 personality role playing')
+    parser.add_argument('--teammate-profile-file', type=str, default=None,
+                        help='independent UTF-8 profile text for Agent 2; overrides legacy task-key lookup')
+    parser.add_argument('--alice-prompt-file', type=str, default=None,
+                        help='planner prompt for Agent 1; defaults to prompt_Peer.txt')
+    parser.add_argument('--bob-prompt-file', type=str, default=None,
+                        help='planner prompt for Agent 2; defaults to prompt_Peer.txt')
+    parser.add_argument('--trace-mode', choices=['off', 'on'], default='off',
+                        help='enable TRACE belief updates and planner injection for Agent 1')
     parser.add_argument('--api_base', type=str, default=None, 
                         help='LLM key')
     parser.add_argument('--api_key', type=str, default="EMPTY",

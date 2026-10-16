@@ -1,0 +1,345 @@
+"""Run one WAH episode with an independent Bob profile and optional TRACE."""
+
+import argparse
+from contextlib import ExitStack, contextmanager
+import fcntl
+import hashlib
+import json
+import os
+import pickle
+import re
+import socket
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+TRACE_ROOT = Path(__file__).resolve().parents[2]
+CWAH_ROOT = TRACE_ROOT / "CWAH"
+GAME_ROOT = CWAH_ROOT / "CWAH-MultiPlayer"
+LOCK_ROOT = Path(__file__).resolve().parent / ".locks"
+AUTO_PORTS = range(6390, 6491)
+
+
+class PortUnavailable(ValueError):
+    """The requested Unity port is reserved or occupied."""
+
+
+def _path(value):
+    candidate = Path(value).expanduser()
+    return (candidate if candidate.is_absolute() else TRACE_ROOT / candidate).resolve()
+
+
+def _label(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("bob_profile.id must contain only letters, numbers, _ or -")
+    return value
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate(config):
+    """Validate an explicit local dataset/configuration; never infer a task mapping."""
+    dataset_cfg = config["dataset"]
+    dataset = _path(dataset_cfg["path"])
+    executable = _path(config["executable_file"])
+    for name, path in (("dataset", dataset), ("executable", executable)):
+        if not path.is_file():
+            raise ValueError(f"{name} file not found: {path}")
+    if not os.access(executable, os.X_OK):
+        raise ValueError(f"executable is not executable: {executable}")
+    index = dataset_cfg["episode_index"]
+    if type(index) is not int or index < 0:
+        raise ValueError("episode_index must be a nonnegative integer")
+    # Only load a locally trusted WAH pickle. This is the file the evaluator loads.
+    with dataset.open("rb") as stream:
+        episodes = pickle.load(stream)
+    if not isinstance(episodes, (list, tuple)) or index >= len(episodes):
+        raise ValueError(f"episode_index {index} is outside this dataset")
+    episode = episodes[index]
+    if not isinstance(episode, dict) or not all(
+        key in episode for key in ("task_id", "task_name", "env_id", "init_graph", "task_goal")
+    ):
+        raise ValueError("selected episode lacks required initialization fields")
+    mode = config["trace_mode"]
+    if mode not in ("off", "on"):
+        raise ValueError("trace_mode must be off or on")
+    prompt_files = {}
+    for role in ("alice", "bob"):
+        raw = config.get(f"{role}_prompt_file")
+        if raw is not None and (not isinstance(raw, str) or not raw.strip()):
+            raise ValueError(f"{role}_prompt_file must be a nonempty path")
+        prompt_path = _path(raw) if raw else GAME_ROOT / "LLM" / "prompt_Peer.txt"
+        if not prompt_path.is_file() or not prompt_path.read_text(encoding="utf-8").strip():
+            raise ValueError(f"{role} prompt missing or empty: {prompt_path}")
+        prompt_files[role] = prompt_path
+    if mode == "on" and "$TRACE_BELIEF" not in prompt_files["alice"].read_text(encoding="utf-8"):
+        raise ValueError("TRACE-on Alice prompt must contain $TRACE_BELIEF")
+    experiment_label = config.get("experiment_label")
+    if experiment_label is not None:
+        experiment_label = _label(experiment_label)
+    profile_cfg = config.get("bob_profile")
+    profile_id, profile_path = "none", None
+    if profile_cfg is not None:
+        profile_id = _label(profile_cfg["id"])
+        profile_path = _path(profile_cfg["text_file"])
+        if not profile_path.is_file() or not profile_path.read_text(encoding="utf-8").strip():
+            raise ValueError(f"Bob profile missing or empty: {profile_path}")
+    for name in ("alice_model", "bob_model"):
+        if not isinstance(config[name], str) or not config[name].strip():
+            raise ValueError(f"{name} must be a nonempty model ID")
+    for name in ("max_tokens", "max_episode_length", "num_runs"):
+        if type(config[name]) is not int or config[name] <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if type(config["temperature"]) not in (int, float) or config["temperature"] < 0:
+        raise ValueError("temperature must be nonnegative")
+    requested_port = config.get("port", "auto")
+    if requested_port is None:
+        requested_port = "auto"
+    if requested_port != "auto" and (type(requested_port) is not int or not 1 <= requested_port <= 65535):
+        raise ValueError("port must be 'auto' or an integer between 1 and 65535")
+    return {
+        "dataset": dataset,
+        "dataset_size": len(episodes),
+        "episode_index": index,
+        "episode": episode,
+        "executable": executable,
+        "profile_id": profile_id,
+        "profile_path": profile_path,
+        "trace_mode": mode,
+        "prompt_files": prompt_files,
+        "experiment_label": experiment_label,
+        "port_request": requested_port,
+    }
+
+
+def _git_revision():
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=TRACE_ROOT,
+                            text=True, capture_output=True, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _git_dirty():
+    result = subprocess.run(["git", "status", "--porcelain"], cwd=TRACE_ROOT,
+                            text=True, capture_output=True, check=False)
+    return bool(result.stdout) if result.returncode == 0 else None
+
+
+@contextmanager
+def port_guard(port):
+    """Prevent two local runners from launching Unity on the same port."""
+    LOCK_ROOT.mkdir(parents=True, exist_ok=True)
+    with (LOCK_ROOT / f"port_{port}.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise PortUnavailable(f"port {port} is reserved by another CWAH experiment") from exc
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError as exc:
+                raise PortUnavailable(f"port {port} is occupied") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def allocated_port(requested_port):
+    """Choose a free port while holding its lock until the experiment exits."""
+    candidates = AUTO_PORTS if requested_port == "auto" else (requested_port,)
+    with ExitStack() as stack:
+        for port in candidates:
+            try:
+                stack.enter_context(port_guard(port))
+            except PortUnavailable:
+                if requested_port != "auto":
+                    raise
+                continue
+            yield port
+            return
+    raise ValueError(f"No free Unity port in {AUTO_PORTS.start}-{AUTO_PORTS.stop - 1}")
+
+
+def _summary(record_dir, index):
+    path = record_dir / "results.pik"
+    if not path.exists():
+        return {"status": "no_results", "episode_index": index}
+    try:
+        with path.open("rb") as stream:
+            result = pickle.load(stream)
+    except (pickle.UnpicklingError, EOFError):
+        return {"status": "unreadable_results", "episode_index": index}
+    values = result.get(index, {})
+    successes = values.get("S", [])
+    steps = values.get("L", [])
+    summary = {"status": "completed" if successes else "no_episode_results", "episode_index": index,
+               "runs": len(successes), "successes": sum(successes),
+               "success_rate": sum(successes) / len(successes) if successes else None,
+               "success": successes, "steps": steps,
+               "mean_steps": sum(steps) / len(steps) if steps else None}
+    trajectory_files = sorted(record_dir.glob("logs_agent_*_*.pik"))
+    summary["trajectories"] = [path.name for path in trajectory_files]
+    summary["planner_calls"] = {"alice": 0, "bob": 0}
+    summary["communication_reply_calls"] = 0
+    summary["trace_updater_calls"] = 0
+    summary["trace_updater_token_usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for trajectory_file in trajectory_files:
+        try:
+            with trajectory_file.open("rb") as stream:
+                trajectory = pickle.load(stream)
+        except (pickle.UnpicklingError, EOFError):
+            summary.setdefault("unreadable_trajectories", []).append(trajectory_file.name)
+            continue
+        llm_calls = trajectory.get("LLM", {})
+        summary["planner_calls"]["alice"] += len(llm_calls.get(0, []))
+        summary["planner_calls"]["bob"] += len(llm_calls.get(1, []))
+        summary["communication_reply_calls"] += trajectory.get("communication_calls", 0)
+        trace = trajectory.get("trace") or {}
+        summary["trace_updater_calls"] += trace.get("updater_calls", 0)
+        for key in summary["trace_updater_token_usage"]:
+            summary["trace_updater_token_usage"][key] += trace.get("updater_token_usage", {}).get(key, 0)
+    return summary
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.local.json"))
+    parser.add_argument("--check", action="store_true", help="validate only; do not start Unity or call a model")
+    args = parser.parse_args(argv)
+    config = json.loads(args.config.read_text(encoding="utf-8"))
+    selected = validate(config)
+    episode = selected["episode"]
+    index = selected["episode_index"]
+    print(f"WAH episode index={index}, task={episode['task_id']}_{episode['task_name']}, "
+          f"env={episode['env_id']}, Bob profile={selected['profile_id']}, "
+          f"TRACE={selected['trace_mode']}, port={selected['port_request']}")
+    print(f"dataset={selected['dataset']}")
+    print("planner_prompts=" + ", ".join(f"{role}:{path.name}" for role, path in selected["prompt_files"].items()))
+    if args.check:
+        print("Configuration valid; Unity and LLM were not started.")
+        return 0
+
+    for name in ("CWAH_AGENT_API_BASE", "CWAH_HUMAN_API_BASE"):
+        if not os.environ.get(name):
+            raise ValueError(f"Set {name} in the shell before running")
+    with allocated_port(selected["port_request"]) as port:
+        print(f"assigned_port={port}", flush=True)
+        return _run_validated(config, selected, episode, index, port)
+
+
+def _run_validated(config, selected, episode, index, port):
+    profile_id = selected["profile_id"]
+    task_name = _label(str(episode["task_name"]))
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    label = f"_{selected['experiment_label']}" if selected["experiment_label"] else ""
+    run_id = f"{task_name}_ep{index}_profile{profile_id}_trace-{selected['trace_mode']}{label}_{timestamp}"
+    category = "trace" if selected["trace_mode"] == "on" else "baseline"
+    record_dir = CWAH_ROOT / "experiments" / category / run_id
+    record_dir.mkdir(parents=True, exist_ok=False)
+    child_env = os.environ.copy()
+    child_env["CWAH_AGENT_LM_ID"] = config["alice_model"]
+    child_env["CWAH_HUMAN_LM_ID"] = config["bob_model"]
+    child_env["PYTHONUNBUFFERED"] = "1"
+    child_env.pop("CWAH_PROFILE_SOURCE_TASK", None)
+    child_env.pop("CWAH_PROFILE_EXPECTED_TASK", None)
+
+    metadata = {
+        "run_id": run_id, "started_at": datetime.now().astimezone().isoformat(),
+        "experiment_kind": "WAH episode with independent Bob profile; not a CollabBench Task 26 reproduction",
+        "dataset_path": str(selected["dataset"]), "dataset_sha256": _sha256(selected["dataset"]),
+        "episode_index": index, "task_id": episode["task_id"], "task_name": episode["task_name"],
+        "environment_id": episode["env_id"], "task_goal": episode["task_goal"],
+        "bob_profile_id": profile_id,
+        "bob_profile_path": str(selected["profile_path"]) if selected["profile_path"] else None,
+        "bob_profile_sha256": _sha256(selected["profile_path"]) if selected["profile_path"] else None,
+        "trace_mode": selected["trace_mode"], "alice_model": config["alice_model"],
+        "experiment_label": selected["experiment_label"],
+        "planner_prompt_files": {role: str(path) for role, path in selected["prompt_files"].items()},
+        "planner_prompt_sha256": {role: _sha256(path) for role, path in selected["prompt_files"].items()},
+        "bob_model": config["bob_model"], "temperature": config["temperature"],
+        "max_tokens": config["max_tokens"], "max_episode_length": config["max_episode_length"],
+        "num_runs": config["num_runs"], "port_request": selected["port_request"], "port": port,
+        "executable_file": str(selected["executable"]),
+        "api_endpoint_hosts": {
+            "alice": urlsplit(child_env["CWAH_AGENT_API_BASE"]).hostname,
+            "bob": urlsplit(child_env["CWAH_HUMAN_API_BASE"]).hostname,
+        },
+        "code_commit": _git_revision(), "code_has_uncommitted_changes": _git_dirty(),
+        "prompt_sha256": {
+            name: _sha256(path) for name, path in {
+                "peer": GAME_ROOT / "LLM" / "prompt_Peer.txt",
+                "reply": GAME_ROOT / "LLM" / "prompt_Reply.txt",
+                "updater": GAME_ROOT / "trace_tf" / "prompt_Updater.txt",
+                "trace_policy": GAME_ROOT / "trace_tf" / "policy.py",
+            }.items()
+        },
+        "observation_type": "partial", "communication": True,
+    }
+    (record_dir / "config.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False, default=str) + "\n",
+                                             encoding="utf-8")
+    command = [sys.executable, "-u", "testing_agents/test_symbolic_LLMs.py",
+               "--communication", "--act", "--cot", "--source", "openai",
+               "--mode", run_id, "--record_dir", str(record_dir),
+               "--dataset_path", str(selected["dataset"]),
+               "--executable_file", str(selected["executable"]),
+               "--base-port", str(port), "--lm_id", config["alice_model"],
+               "--api_base", child_env["CWAH_AGENT_API_BASE"],
+               "--t", str(config["temperature"]), "--max_tokens", str(config["max_tokens"]),
+               "--max-episode-length", str(config["max_episode_length"]),
+               "--num_runs", str(config["num_runs"]), "--num-per-task", "1",
+               "--test_task", str(index), "--trace-mode", selected["trace_mode"],
+               "--alice-prompt-file", str(selected["prompt_files"]["alice"]),
+               "--bob-prompt-file", str(selected["prompt_files"]["bob"])]
+    if selected["profile_path"]:
+        command += ["--teammate-profile-file", str(selected["profile_path"])]
+
+    print(f"results={record_dir}", flush=True)
+    with (record_dir / "console.log").open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=GAME_ROOT, env=child_env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in process.stdout:
+            log.write(line)
+            step_match = re.match(r"^Step (\d+), Executing script:", line)
+            if step_match:
+                step = int(step_match.group(1)) + 1
+                print(f"[progress] {run_id} step={step}/{config['max_episode_length']}", flush=True)
+                log.flush()
+            elif line.startswith(("Init Env", "episode:", "success", "failure", "steps:")):
+                print(line, end="", flush=True)
+        exit_code = process.wait()
+    summary = _summary(record_dir, index)
+    summary["runner_exit_code"] = exit_code
+    (record_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    outcome = "completed" if exit_code == 0 and summary["status"] == "completed" and summary["runs"] == config["num_runs"] else "failed"
+    (record_dir / "status.md").write_text(
+        f"# Experiment status\n\n- Outcome: {outcome}\n- WAH episode: {index} "
+        f"({episode['task_id']}_{episode['task_name']}, environment {episode['env_id']})\n"
+        f"- Bob profile: {profile_id}; TRACE: {selected['trace_mode']}\n"
+        f"- Planner prompts: Alice `{selected['prompt_files']['alice'].name}`, "
+        f"Bob `{selected['prompt_files']['bob'].name}`\n"
+        f"- Success per run: {summary.get('success', 'unavailable')}\n"
+        f"- Environment steps per run: {summary.get('steps', 'unavailable')}\n"
+        f"- Results: `summary.json`, `results.pik`, `logs_agent_*.pik`; console: `console.log`\n"
+        "- WAH data experiment, not a strict CollabBench Task 26 reproduction.\n",
+        encoding="utf-8")
+    print(f"{outcome}: {record_dir}")
+    return 0 if outcome == "completed" else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (KeyError, ValueError, OSError) as exc:
+        print(f"Experiment configuration error: {exc}", file=sys.stderr)
+        sys.exit(2)

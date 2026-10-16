@@ -1,4 +1,4 @@
-"""One-shot, action-free replies to active peer messages."""
+"""Message-triggered reactive planning without directly changing environment actions."""
 
 import re
 import time
@@ -16,21 +16,51 @@ def visible_object_summary(observation, limit=40):
     return ", ".join(names[:limit]) + (" ..." if len(names) > limit else "") or "none visible"
 
 
+def observed_self_state(observation, agent_id):
+    """Read only the recipient's own room and held objects from a fresh partial view."""
+    if agent_id is None or "nodes" not in observation or "edges" not in observation:
+        return "Unknown", "Unknown"
+    nodes = {node["id"]: node for node in observation["nodes"]}
+    room = "Unknown"
+    held = []
+    for edge in observation["edges"]:
+        if edge.get("from_id") != agent_id:
+            continue
+        target_id = edge.get("to_id")
+        target = nodes.get(target_id, {})
+        relation = edge.get("relation_type")
+        if relation == "INSIDE" and target.get("category") == "Rooms":
+            room = target["class_name"]
+        elif relation in ("HOLDS_RH", "HOLDS_LH"):
+            held.append(f"<{target.get('class_name', 'object')}> ({target_id})")
+    return room, ", ".join(held) if held else "None"
+
+
 class CommunicationModule:
     def __init__(self, planner):
         self.planner = planner
 
-    def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation):
+    def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
+              agent_id=None, progress="Unknown", action_history=(), belief_context=""):
         prompt = REPLY_TEMPLATE
+        observed_room, holding = observed_self_state(
+            observation, agent_id if agent_id is not None else getattr(self.planner, "agent_id", None)
+        )
         values = {
             "$AGENT_NAME": self.planner.agent_name,
             "$OPPO_NAME": self.planner.oppo_name,
             "$ASSIGNED_PERSONALITY": self.planner.personality or "None",
             "$GOAL": self.planner.goal_desc or "Unknown",
             "$CURRENT_SKILL": current_skill or "None",
-            "$CURRENT_ROOM": current_room or "Unknown",
-            "$VISIBLE_OBJECTS": visible_object_summary(observation),
+            "$PROGRESS": (
+                f"Current room: {observed_room}\n"
+                f"Currently held objects: {holding}\n"
+                f"Visible relevant objects: {visible_object_summary(observation)}\n"
+                f"{progress or 'Unknown'}"
+            ),
+            "$ACTION_HISTORY": ", ".join(action_history) if action_history else "None",
             "$DIALOGUE_HISTORY": "\n".join(dialogue_history) or "None",
+            "$TRACE_BELIEF": belief_context or "TRACE is disabled. No teammate belief is available.",
             "$INCOMING_MESSAGE": incoming_message,
         }
         for placeholder, value in values.items():
@@ -47,12 +77,18 @@ class CommunicationModule:
         outputs, legacy_cost = self.planner.generator(request, params)
         elapsed = time.monotonic() - started
         raw = outputs[0] if outputs else ""
-        match = re.search(r"<reply>\s*(.*?)\s*</reply>", raw, re.I | re.S)
-        reply = match.group(1).strip()[:500] if match else None
+        intention_match = re.search(r"<intention>\s*(.*?)\s*</intention>", raw, re.I | re.S)
+        reply_match = re.search(r"<reply>\s*(.*?)\s*</reply>", raw, re.I | re.S)
+        intention = intention_match.group(1).strip()[:500] if intention_match else ""
+        reply = reply_match.group(1).strip()[:500] if reply_match else ""
+        if not intention or not reply:
+            raise ValueError("reactive planner must output non-empty <intention> and <reply>")
         return reply, {
             "model": self.planner.lm_id,
             "prompt": prompt,
             "raw_output": raw,
+            "intention": intention,
+            "reply": reply,
             "usage": self.planner.last_usage_metadata,
             "legacy_cost_estimate": legacy_cost,
             "latency_seconds": elapsed,

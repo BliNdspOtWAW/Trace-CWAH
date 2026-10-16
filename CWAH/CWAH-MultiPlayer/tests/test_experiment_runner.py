@@ -1,0 +1,193 @@
+"""Config and integration checks that never start Unity or call a model."""
+
+import json
+import os
+import pickle
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "experiment_runner"))
+import run_experiment  # noqa: E402
+import run_many  # noqa: E402
+from run_experiment import validate  # noqa: E402
+
+from LLM.LLM import LLM  # noqa: E402
+from agents.LLM_agent import LLM_agent  # noqa: E402
+from trace_tf.events import EvidenceLedger  # noqa: E402
+from trace_tf.model import BeliefState  # noqa: E402
+
+
+class ExperimentRunnerTests(unittest.TestCase):
+    def test_wah_episode_and_profile_are_independent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            dataset = folder / "wah.pik"
+            with dataset.open("wb") as stream:
+                pickle.dump([{"task_id": 44, "task_name": "prepare_food", "env_id": 3,
+                              "init_graph": {"nodes": [], "edges": []}, "task_goal": {}}], stream)
+            executable = folder / "unity"
+            executable.write_text("simulator placeholder", encoding="utf-8")
+            executable.chmod(0o755)
+            profile = folder / "peer.txt"
+            profile.write_text("Bob acts independently.\n", encoding="utf-8")
+            config = {"dataset": {"path": str(dataset), "episode_index": 0},
+                      "executable_file": str(executable),
+                      "bob_profile": {"id": "independent", "text_file": str(profile)},
+                      "trace_mode": "on", "alice_model": "alice", "bob_model": "bob",
+                      "temperature": 0, "max_tokens": 256, "max_episode_length": 250,
+                      "num_runs": 1}
+            selected = validate(config)
+            self.assertEqual(selected["episode"]["task_id"], 44)
+            self.assertEqual(selected["profile_path"], profile)
+            self.assertEqual(selected["port_request"], "auto")
+            self.assertEqual(selected["prompt_files"]["alice"].name, "prompt_Peer.txt")
+            self.assertEqual(selected["prompt_files"]["bob"].name, "prompt_Peer.txt")
+            with patch.dict(os.environ, {"CWAH_PROFILE_SOURCE_TASK": "26_prepare_food",
+                                      "CWAH_PROFILE_EXPECTED_TASK": "50_prepare_food"}):
+                args = SimpleNamespace(debug=False, act=False, big_5=None,
+                                       teammate_profile_file=str(profile), api_base=None, api_key=None)
+                bob = LLM("debug", "test-model", "unused", True, False, args, 2)
+                alice = LLM("debug", "test-model", "unused", True, False, args, 1)
+                for agent in (bob, alice):
+                    with patch.object(agent, "goal2description", return_value=("goal", "table")):
+                        agent.reset({"nodes": []}, [], {}, "<table> (1)", {}, "44_prepare_food")
+                self.assertEqual(bob.personality, "Bob acts independently.")
+                self.assertEqual(alice.personality, "")
+
+    def test_role_specific_original_human_prompt(self):
+        peer = run_experiment.GAME_ROOT / "LLM" / "prompt_Peer.txt"
+        human = run_experiment.GAME_ROOT / "LLM" / "prompt_Human.txt"
+        args = SimpleNamespace(debug=False, act=False, big_5=None, api_base=None, api_key=None,
+                               alice_prompt_file=str(peer), bob_prompt_file=str(human))
+        alice = LLM("debug", "test", "unused", True, False, args, 1)
+        bob = LLM("debug", "test", "unused", True, False, args, 2)
+        self.assertEqual(alice.prompt_template_path, str(peer))
+        self.assertEqual(bob.prompt_template_path, str(human))
+        self.assertIn("equal authority", alice.prompt_template)
+        self.assertIn("You must send a message", bob.prompt_template)
+        self.assertNotIn("$AGENT_NAME", bob.prompt_template)
+
+    def test_official_configs_use_unified_peer_prompt(self):
+        config_dir = Path(__file__).resolve().parents[2] / "experiment_runner" / "configs"
+        configs = [json.loads(path.read_text()) for path in sorted(config_dir.glob("*.json"))]
+        self.assertTrue(configs)
+        for config in configs:
+            selected = validate(config)
+            self.assertEqual(selected["prompt_files"]["alice"].name, "prompt_Peer.txt")
+            self.assertEqual(selected["prompt_files"]["bob"].name, "prompt_Peer.txt")
+
+    def test_trace_switch_controls_updater(self):
+        room = {"id": 11, "class_name": "kitchen", "category": "Rooms"}
+        table = {"id": 12, "class_name": "table", "category": "Objects"}
+        obs = {"nodes": [room, table], "edges": [{"from_id": 1, "relation_type": "INSIDE", "to_id": 11}]}
+        for mode in ("off", "on"):
+            with self.subTest(mode=mode):
+                args = SimpleNamespace(debug=False, act=False, big_5=None, teammate_profile_file=None,
+                                       trace_mode=mode, obs_type="partial", source="debug", lm_id="test-model",
+                                       prompt_template_path="unused", communication=True, cot=False,
+                                       api_base=None, api_key=None)
+                agent = LLM_agent(1, 0, args)
+                with patch.object(agent.LLM, "reset"):
+                    agent.reset(obs, [], [], ["kitchen"], [room],
+                                {"on_apple_<table> (12)": [1]}, "44_prepare_food")
+                self.assertEqual(agent.trace is not None, mode == "on")
+
+    def test_trace_updates_before_reactive_planner(self):
+        order = []
+        state = BeliefState(2)
+        ledger = EvidenceLedger()
+        trace = SimpleNamespace(
+            state=state,
+            ledger=ledger,
+            update=Mock(side_effect=lambda: (order.append("trace") or (state, {
+                "new_event_ids": ["e00000"]
+            }))),
+        )
+        communication = SimpleNamespace(
+            reply=Mock(side_effect=lambda *args, **kwargs: (
+                order.append("reactive") or ("I will continue.", {
+                    "intention": "Continue the current task."
+                })
+            ))
+        )
+        agent = LLM_agent.__new__(LLM_agent)
+        agent.current_room = {"class_name": "kitchen"}
+        agent.trace = trace
+        agent.satisfied = []
+        agent.unsatisfied = {"on_apple_table": 1}
+        agent.last_action = "[walktowards] <apple> (12)"
+        agent.plan = "[gograb] <apple> (12)"
+        agent.action_history = [agent.plan]
+        agent.dialogue_history = ["Bob: I found the apple."]
+        agent.communication_module = communication
+        agent.agent_id = 1
+
+        reply, call = agent.reply_to_message(
+            "I found the apple.", {"nodes": [], "edges": []}
+        )
+
+        self.assertEqual(order, ["trace", "reactive"])
+        self.assertEqual(reply, "I will continue.")
+        self.assertTrue(call["trace_enabled"])
+        self.assertTrue(call["trace_updated"])
+        self.assertEqual(call["trace_new_event_ids"], ["e00000"])
+        self.assertEqual(agent.plan, "[gograb] <apple> (12)")
+
+    def test_port_lock_blocks_another_local_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(run_experiment, "LOCK_ROOT", Path(temporary)), \
+                    patch.object(run_experiment, "AUTO_PORTS", range(6390, 6392)), \
+                    patch.object(run_experiment.socket, "socket"):
+                with run_experiment.allocated_port("auto") as first:
+                    with run_experiment.allocated_port("auto") as second:
+                        self.assertEqual((first, second), (6390, 6391))
+                    with self.assertRaisesRegex(ValueError, "reserved"):
+                        with run_experiment.allocated_port(6390):
+                            pass
+
+    def test_batch_preflight_rejects_duplicate_ports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "first.json").write_text('{"port": 6390}', encoding="utf-8")
+            (folder / "second.json").write_text('{"port": 6390}', encoding="utf-8")
+            (folder / "third.json.example").write_text('{"port": 6390}', encoding="utf-8")
+            selected = {"episode": {"task_id": 44, "task_name": "prepare_food"},
+                        "episode_index": 44, "profile_id": "peer17", "trace_mode": "off"}
+            with patch.object(run_many, "validate", side_effect=lambda config: {
+                    **selected, "port_request": config.get("port", "auto")}):
+                with self.assertRaisesRegex(ValueError, "Duplicate port"):
+                    run_many.preflight(folder)
+                (folder / "second.json").write_text('{"port": 6391}', encoding="utf-8")
+                self.assertEqual(run_many.main(["--config-dir", str(folder), "--check"]), 0)
+                (folder / "first.json").write_text('{"port": "auto"}', encoding="utf-8")
+                (folder / "second.json").write_text('{"port": "auto"}', encoding="utf-8")
+                self.assertEqual(len(run_many.preflight(folder)), 2)
+
+    def test_batch_runner_streams_to_terminal_without_batch_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            configs = folder / "configs"
+            configs.mkdir()
+            (configs / "one.json").write_text("{}", encoding="utf-8")
+            selected = {
+                "episode": {"task_id": 44, "task_name": "prepare_food"},
+                "episode_index": 44, "profile_id": "peer17",
+                "trace_mode": "off", "port_request": "auto",
+            }
+            process = SimpleNamespace(pid=1234, poll=Mock(return_value=0))
+            with patch.object(run_many, "RUNNER_DIR", folder), \
+                    patch.object(run_many, "validate", return_value=selected), \
+                    patch.object(run_many.subprocess, "Popen", return_value=process) as popen:
+                self.assertEqual(run_many.main([
+                    "--config-dir", str(configs), "--max-parallel", "1"
+                ]), 0)
+            self.assertFalse((folder / "batch_logs").exists())
+            self.assertNotIn("stdout", popen.call_args.kwargs)
+            self.assertNotIn("stderr", popen.call_args.kwargs)
+
+if __name__ == "__main__":
+    unittest.main()

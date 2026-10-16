@@ -1,0 +1,249 @@
+"""One-call hybrid updater: legal history, LLM interpretation, rule settlement."""
+
+import json
+import re
+import time
+from pathlib import Path
+
+from .events import EvidenceLedger
+from .model import BeliefState, Evidence, EvidenceSource
+
+
+PROMPT = Path(__file__).with_name("prompt_Updater.txt").read_text(encoding="utf-8")
+SCORED = ("intent", "capability", "preference", "reliability")
+ACTIONS = {"goexplore", "gocheck", "gograb", "goput", "send_message"}
+
+
+def _unit(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return 1.0
+    return float(value)
+
+
+class HybridUpdater:
+    def __init__(self, planner, teammate_id=2):
+        self.planner = planner
+        self.ledger = EvidenceLedger(target_id=1, peer_id=teammate_id)
+        self.state = BeliefState(teammate_id)
+        self.cursor = 0
+        self.commitments = {}
+        self.update_log = []
+        self.last_context = ""
+
+    def _evidence(self, events):
+        evidence = []
+        for event in events:
+            if event.kind == "message":
+                source = (EvidenceSource.TEAMMATE_MESSAGE if event.payload["sender"] == 2
+                          else EvidenceSource.OWN_MESSAGE)
+            elif event.kind == "own_action":
+                source = EvidenceSource.OWN_ACTION
+            elif event.kind == "peer_task_outcome":
+                source = EvidenceSource.VISIBLE_PEER_OUTCOME
+            else:
+                source = EvidenceSource.VISIBLE_OBSERVATION
+            evidence.append(Evidence(source, event.step, event.kind, event.event_id))
+        return evidence
+
+    def _apply(self, dimension, value, uncertainty, events):
+        existing = {e.reference for e in self.state.dimensions[dimension].evidence}
+        new = [e for e in self._evidence(events) if e.reference not in existing]
+        if new:
+            self.state = self.state.with_evidence(dimension, value, 1 - uncertainty,
+                                                  new, uncertainty=uncertainty)
+
+    def _prompt_events(self, events):
+        result = []
+        for event in events:
+            payload = event.payload
+            if event.kind == "observation":
+                nodes = payload["nodes"]
+                payload = {"visible_objects": [
+                    {"id": node["id"], "class_name": node["class_name"]}
+                    for node in nodes if node.get("category") != "Rooms"
+                ], "visible_peer_edges": [edge for edge in payload["edges"]
+                                           if edge["from_id"] == 2 or edge["to_id"] == 2]}
+            result.append({"event_id": event.event_id, "step": event.step,
+                           "kind": event.kind, "payload": payload})
+        return result
+
+    def _infer(self):
+        # Keep the full legal ledger for audit; the LLM receives compact graph views
+        # plus every delivered message and observed outcome, and the latest view.
+        observations = [e for e in self.ledger.events if e.kind == "observation"]
+        selected = [e for e in self.ledger.events if e.kind != "observation"]
+        if observations:
+            selected.append(observations[-1])
+        selected.sort(key=lambda e: int(e.event_id[1:]))
+        prompt = PROMPT.replace("$BELIEF", self.state.to_json())
+        prompt = prompt.replace("$COMMITMENTS", json.dumps(list(self.commitments.values()), ensure_ascii=False))
+        prompt = prompt.replace("$EVENTS", json.dumps(self._prompt_events(selected), ensure_ascii=False))
+        sampling = self.planner.sampling_params
+        params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
+        params["n"] = 1
+        params["temperature"] = 0
+        limit_key = "max_tokens" if self.planner.chat else "max_new_tokens"
+        params[limit_key] = min(params.get(limit_key, 768), 768)
+        request = [{"role": "user", "content": prompt}] if self.planner.chat else prompt
+        started = time.monotonic()
+        outputs, legacy_cost = self.planner.generator(request, params)
+        latency = time.monotonic() - started
+        raw = outputs[0] if outputs else ""
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.I | re.S)
+        data = json.loads(match.group(1) if match else raw.strip())
+        if not isinstance(data, dict):
+            raise ValueError("updater output must be an object")
+        return data, {"model": self.planner.lm_id, "usage": self.planner.last_usage_metadata,
+                      "legacy_cost_estimate": legacy_cost, "latency_seconds": latency,
+                      "prompt": prompt, "raw_output": raw}
+
+    def _valid_events(self, ids):
+        by_id = self.ledger.by_id()
+        if not isinstance(ids, list) or not all(isinstance(i, str) and i in by_id for i in ids):
+            return []
+        return [by_id[i] for i in dict.fromkeys(ids)]
+
+    def _peer_evidence(self, events):
+        """Alice's own request alone cannot establish Bob's intent/preference."""
+        result = []
+        for event in events:
+            if event.kind == "message" and event.payload["sender"] == 2:
+                result.append(event)
+            elif event.kind == "peer_task_outcome":
+                result.append(event)
+            elif event.kind == "observation" and any(
+                node["id"] == 2 for node in event.payload["nodes"]
+            ):
+                result.append(event)
+        return result
+
+    def _accept_commitments(self, proposals):
+        if not isinstance(proposals, list):
+            return
+        by_id = self.ledger.by_id()
+        for item in proposals:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("acceptance_event_id")
+            accepted = by_id.get(key)
+            action = item.get("action")
+            obj = item.get("object")
+            if (not accepted or accepted.kind != "message" or accepted.payload["sender"] != 2
+                    or action not in ("grab", "place", "search")
+                    or (obj is not None and not isinstance(obj, str))
+                    or not self._valid_events(item.get("evidence_ids", []))):
+                continue
+            proposed = item.get("proposed_status")
+            if proposed not in ("pending", "fulfilled", "violated", "unverifiable"):
+                proposed = "unverifiable"
+            if key not in self.commitments:
+                self.commitments[key] = {
+                    "commitment_id": key, "acceptance_event_id": key,
+                    "action": action, "object": obj, "status": "pending",
+                    "evidence_ids": [key], "llm_proposed_status": proposed,
+                    "llm_evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
+                }
+            else:
+                self.commitments[key]["llm_proposed_status"] = proposed
+                self.commitments[key]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
+
+    def _settle_commitments(self):
+        for commitment in self.commitments.values():
+            if commitment["status"] != "pending":
+                continue
+            accepted_step = self.ledger.by_id()[commitment["acceptance_event_id"]].step
+            for event in self.ledger.events:
+                outcome = event.payload
+                if (event.step < accepted_step or event.kind != "peer_task_outcome"
+                        or not outcome.get("verified") or outcome.get("action") != commitment["action"]
+                        or (commitment["object"] and outcome.get("object") != commitment["object"])):
+                    continue
+                if outcome.get("success") is True:
+                    commitment["status"] = "fulfilled"
+                elif outcome.get("success") is False and outcome.get("terminal") is True:
+                    commitment["status"] = "violated"
+                if commitment["status"] != "pending":
+                    commitment["evidence_ids"].append(event.event_id)
+                    break
+
+    def update(self):
+        new = self.ledger.since(self.cursor)
+        if not new:
+            return self.state, None
+        before = self.state.to_dict()
+        self.cursor = len(self.ledger.events)
+        self._apply("information", {"event_ids": [e.event_id for e in self.ledger.events],
+                                    "event_count": len(self.ledger.events)}, 0.0, new)
+
+        call = None
+        inference = {}
+        try:
+            inference, call = self._infer()
+        except Exception as exc:
+            call = {"error": "{}: {}".format(type(exc).__name__, exc),
+                    "model": self.planner.lm_id, "usage": self.planner.last_usage_metadata}
+
+        self._accept_commitments(inference.get("commitments", []))
+        self._settle_commitments()
+        proposals = inference.get("uncertainty", {})
+        if not isinstance(proposals, dict):
+            proposals = {}
+        uncertainties = {}
+
+        for dimension in ("intent", "preference"):
+            entry = inference.get(dimension, {})
+            entry = entry if isinstance(entry, dict) else {}
+            events = self._peer_evidence(self._valid_events(entry.get("evidence_ids", [])))
+            value = entry.get("action") if dimension == "intent" else entry.get("description")
+            if dimension == "intent" and value not in ACTIONS:
+                value = None
+            if dimension == "preference" and (not isinstance(value, str) or len(events) < 2):
+                value = None
+            if value is not None and events:
+                floor = 1.0 / (len(events) + 1)
+                u = max(_unit(proposals.get(dimension)), floor)
+                detail = {"action": value, "target": entry.get("target")} if dimension == "intent" else {"description": value}
+                self._apply(dimension, detail, u, events)
+                uncertainties[dimension] = u
+            else:
+                if dimension == "intent" and self.state.dimensions[dimension].status == "supported":
+                    prior_refs = {e.reference for e in self.state.dimensions[dimension].evidence}
+                    withdrawal = [e for e in self._evidence(new) if e.reference not in prior_refs]
+                    if withdrawal:
+                        self.state = self.state.with_unknown("intent", withdrawal)
+                prior = self.state.dimensions[dimension]
+                uncertainties[dimension] = 1.0 if prior.status == "unknown" or prior.uncertainty is None else prior.uncertainty
+
+        attempts = [e for e in self.ledger.events if e.kind == "peer_task_outcome" and e.payload.get("verified")]
+        successes = sum(e.payload.get("success") is True for e in attempts)
+        failures = sum(e.payload.get("success") is False and e.payload.get("terminal") is True for e in attempts)
+        count = successes + failures
+        if count:
+            u = max(_unit(proposals.get("capability")), 1.0 / (count + 1))
+            self._apply("capability", {"successes": successes, "failures": failures,
+                                       "success_rate": successes / count}, u, attempts)
+            uncertainties["capability"] = u
+        else:
+            uncertainties["capability"] = 1.0
+
+        fulfilled = sum(c["status"] == "fulfilled" for c in self.commitments.values())
+        violated = sum(c["status"] == "violated" for c in self.commitments.values())
+        resolved = fulfilled + violated
+        u = max(_unit(proposals.get("reliability")), 1.0 / (resolved + 1)) if resolved else 1.0
+        reliability_events = [self.ledger.by_id()[eid] for commitment in self.commitments.values()
+                              for eid in commitment["evidence_ids"]]
+        if reliability_events:
+            self._apply("reliability", {
+                "fulfillments": fulfilled, "violations": violated,
+                "fulfillment_rate": fulfilled / resolved if resolved else None,
+                "commitment_events": list(self.commitments.values()),
+            }, u, reliability_events)
+        uncertainties["reliability"] = u
+
+        overall = sum(uncertainties[name] for name in SCORED) / 4
+        self._apply("uncertainty", {"per_dimension": uncertainties, "overall": overall},
+                    overall, new)
+        record = {"new_event_ids": [e.event_id for e in new], "belief_before": before,
+                  "belief_after": self.state.to_dict(), "llm_call": call}
+        self.update_log.append(record)
+        return self.state, record

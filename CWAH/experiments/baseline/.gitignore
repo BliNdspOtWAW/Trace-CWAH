@@ -1,0 +1,4 @@
+# Local baseline runs can contain full prompts, trajectories and model outputs.
+/prepare_food_profile*_*/
+/prepare_food_profile_comparison_*.csv
+/*_ep*_profile*_trace-*_*/

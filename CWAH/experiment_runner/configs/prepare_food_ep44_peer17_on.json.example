@@ -1,0 +1,19 @@
+{
+  "dataset": {
+    "path": "CWAH/dataset-candidates/wah/test_env_set_help.pik",
+    "episode_index": 44
+  },
+  "bob_profile": {
+    "id": "peer17",
+    "text_file": "CWAH/experiment_runner/profiles/peer17.txt"
+  },
+  "trace_mode": "on",
+  "alice_model": "deepseek-ai/DeepSeek-V3.1",
+  "bob_model": "deepseek-ai/DeepSeek-V3.1",
+  "temperature": 0,
+  "max_tokens": 1024,
+  "max_episode_length": 250,
+  "num_runs": 1,
+  "port": "auto",
+  "executable_file": "CWAH/executable/linux_exec.v2.3.0.x86_64"
+}
