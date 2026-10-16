@@ -1,4 +1,6 @@
-# TRACE baseline verification status
+# TRACE baseline environment verification
+
+Commit: `822b2e0 Initialize TRACE baseline experiment environment`
 
 Checked on 2026-10-15 for the initial `main` baseline. This baseline records
 a working research environment and experiment pipeline, not a claim that
