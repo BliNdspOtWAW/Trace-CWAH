@@ -6,6 +6,7 @@ import os
 import pandas as pd
 from openai.error import OpenAIError
 import backoff
+from trace_tf.information import DecisionInformation
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
 df = pd.read_csv(csv_path)
@@ -561,22 +562,31 @@ class LLM:
     def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers,
             ungrabbed_objects, goal_location_room, action_history, dialogue_history,
             opponent_grabbed_objects, opponent_last_room, room_explored=None, steps=0,
-            belief_context="", put_options=None):
+            belief_context="", put_options=None, decision_information=None):
         info = {}
-        progress_desc = self.progress2text(current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored)
-        action_history_desc = ", ".join(action_history[-10:] if len(action_history) > 10 else action_history)
-        dialogue_history_desc = '\n'.join(dialogue_history) or 'None'
-        prompt = self.prompt_template.replace('$GOAL', self.goal_desc)
+        information = decision_information or self.build_decision_information(
+            location, current_room, grabbed_objects, satisfied, unchecked_containers,
+            ungrabbed_objects, goal_location_room, action_history, dialogue_history,
+            opponent_grabbed_objects, opponent_last_room, room_explored, steps,
+            put_options=put_options,
+        )
+        progress_desc = information.current_progress
+        action_history_desc = ", ".join(information.action_history) or 'None'
+        dialogue_history_desc = '\n'.join(information.dialogue_history) or 'None'
+        prompt = self.prompt_template.replace('$GOAL', information.goal)
         prompt = prompt.replace('$PROGRESS', progress_desc)
-        prompt = prompt.replace('$STEP', str(steps))
+        prompt = prompt.replace('$STEP', str(information.step))
         prompt = prompt.replace('$ACTION_HISTORY', action_history_desc)
-        prompt = prompt.replace('$ASSIGNED_PERSONALITY', self.personality or 'None')
+        prompt = prompt.replace('$ASSIGNED_PERSONALITY', information.personality)
         prompt = prompt.replace('$DIALOGUE_HISTORY', dialogue_history_desc)
         prompt = prompt.replace('$TRACE_BELIEF', belief_context)
-        available_plans, available_plans_refine, available_plans_list, available_plans_list_refine, num = self.get_available_plans(
-            location, grabbed_objects, unchecked_containers, ungrabbed_objects,
-            None, room_explored, put_options=put_options
+        available_plans_list = list(information.available_actions_with_distance)
+        available_plans_list_refine = list(information.available_actions)
+        available_plans_refine = ''.join(
+            f"{chr(ord('A') + i)}. {plan}\n"
+            for i, plan in enumerate(available_plans_list_refine)
         )
+        num = len(available_plans_list_refine)
         if num == 0:
             print("Warning! No available plans!")
             plan = None
@@ -622,7 +632,37 @@ class LLM:
             "oppo_name": self.oppo_name,
             "agent_name": self.agent_name
         })
+        info["shared_information"] = information.to_dict()
         print("*************outputs******************")
         print(outputs)
         print("*************************************")
         return plan, info
+
+    def build_decision_information(
+            self, location, current_room, grabbed_objects, satisfied,
+            unchecked_containers, ungrabbed_objects, goal_location_room,
+            action_history, dialogue_history, opponent_grabbed_objects,
+            opponent_last_room, room_explored=None, steps=0, put_options=None,
+            source_event_ids=()):
+        """Build once so TRACE and Active Planner see the same legal context."""
+        progress = self.progress2text(
+            current_room, grabbed_objects, unchecked_containers, ungrabbed_objects,
+            goal_location_room, satisfied, opponent_grabbed_objects,
+            opponent_last_room, room_explored,
+        )
+        _, _, with_distance, refined, _ = self.get_available_plans(
+            location, grabbed_objects, unchecked_containers, ungrabbed_objects,
+            None, room_explored, put_options=put_options,
+        )
+        return DecisionInformation(
+            planner_type="active",
+            goal=self.goal_desc or "Unknown",
+            personality=self.personality or "None",
+            current_progress=progress,
+            action_history=tuple(action_history[-10:]),
+            dialogue_history=tuple(dialogue_history),
+            available_actions=tuple(refined),
+            available_actions_with_distance=tuple(with_distance),
+            step=int(steps),
+            source_event_ids=tuple(source_event_ids),
+        )

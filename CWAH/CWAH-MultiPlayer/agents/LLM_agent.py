@@ -211,17 +211,37 @@ class LLM_agent:
 
 
 	def LLM_plan(self, location):
+		put_options = self._put_options()
+		source_event_ids = self._trace_source_event_ids()
+		information = self.LLM.build_decision_information(
+			location, self.current_room, [self.id2node[x] for x in self.grabbed_objects],
+			self.satisfied, self.unchecked_containers, self.ungrabbed_objects, None,
+			self.action_history, self.dialogue_history, self.opponent_grabbed_objects,
+			self.id_inside_room[self.opponent_agent_id], None, self.steps,
+			put_options=put_options, source_event_ids=source_event_ids,
+		)
 		context = ""
 		if self.trace is not None:
-			self.trace.update()
+			self.trace.update(information.to_dict())
 			context = render_policy_context(self.trace.state, self.trace.ledger)
 		return self.LLM.run(
 			location, self.current_room, [self.id2node[x] for x in self.grabbed_objects],
 			self.satisfied, self.unchecked_containers, self.ungrabbed_objects, None,
 			self.action_history, self.dialogue_history, self.opponent_grabbed_objects,
 			self.id_inside_room[self.opponent_agent_id], None, self.steps,
-			belief_context=context, put_options=self._put_options(),
+			belief_context=context, put_options=put_options,
+			decision_information=information,
 		)
+
+	def _trace_source_event_ids(self):
+		if self.trace is None:
+			return ()
+		new = self.trace.ledger.since(getattr(self.trace, 'cursor', 0))
+		ids = [event.event_id for event in new]
+		observations = [event for event in self.trace.ledger.events if event.kind == 'observation']
+		if observations and observations[-1].event_id not in ids:
+			ids.append(observations[-1].event_id)
+		return tuple(ids)
 
 
 	def check_progress(self, state, goal_spec):
@@ -453,19 +473,26 @@ class LLM_agent:
 		room = self.current_room['class_name'] if self.current_room else None
 		belief_context = "TRACE is disabled. No teammate belief is available."
 		trace_record = None
-		if self.trace is not None:
-			state, trace_record = self.trace.update()
-			belief_context = render_reply_context(state, self.trace.ledger)
 		known_satisfied = [f"<{item['class_name']}> ({item['id']})" for item in self.satisfied]
 		progress = (
 			f"Last selected environment action: {self.last_action or 'None'}\n"
 			f"Known satisfied goal objects: {', '.join(known_satisfied) or 'None'}\n"
 			f"Known remaining goal requirements: {self.unsatisfied or 'Unknown'}"
 		)
+		information = self.communication_module.build_decision_information(
+			message, self.dialogue_history, self.plan, observation,
+			agent_id=self.agent_id, progress=progress,
+			action_history=self.action_history[-10:], step=getattr(self, 'steps', 0),
+			source_event_ids=self._trace_source_event_ids(),
+		)
+		if self.trace is not None:
+			state, trace_record = self.trace.update(information.to_dict())
+			belief_context = render_reply_context(state, self.trace.ledger)
 		reply, call = self.communication_module.reply(
 			message, self.dialogue_history, self.plan, room, observation,
 			agent_id=self.agent_id, progress=progress,
 			action_history=self.action_history[-10:], belief_context=belief_context,
+			decision_information=information,
 		)
 		call.update({
 			"planner_type": "reactive",

@@ -115,11 +115,15 @@ class ExperimentRunnerTests(unittest.TestCase):
         trace = SimpleNamespace(
             state=state,
             ledger=ledger,
-            update=Mock(side_effect=lambda: (order.append("trace") or (state, {
+            cursor=0,
+            update=Mock(side_effect=lambda *_args, **_kwargs: (order.append("trace") or (state, {
                 "new_event_ids": ["e00000"]
             }))),
         )
         communication = SimpleNamespace(
+            build_decision_information=Mock(return_value=SimpleNamespace(
+                to_dict=lambda: {"planner_type": "reactive", "goal": "place apple"}
+            )),
             reply=Mock(side_effect=lambda *args, **kwargs: (
                 order.append("reactive") or ("I will continue.", {
                     "intention": "Continue the current task."
@@ -137,6 +141,7 @@ class ExperimentRunnerTests(unittest.TestCase):
         agent.dialogue_history = ["Bob: I found the apple."]
         agent.communication_module = communication
         agent.agent_id = 1
+        agent.steps = 3
 
         reply, call = agent.reply_to_message(
             "I found the apple.", {"nodes": [], "edges": []}

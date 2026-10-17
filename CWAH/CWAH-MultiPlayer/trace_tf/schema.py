@@ -74,7 +74,7 @@ class BeliefSchema:
 DEFAULT_SCHEMA = BeliefSchema.define(
     "trace-v0-six-dimensions",
     (
-        DimensionSpec("information", "Complete legal evidence history available to the target agent; no inference about teammate knowledge", "fast"),
+        DimensionSpec("information", "Current legal decision context shared with the target agent's planner; no inference about teammate knowledge", "fast"),
         DimensionSpec("capability", "Observed ability or efficiency on task actions", "slow"),
         DimensionSpec("intent", "Current goal, plan, or subtask inferred from evidence", "fast"),
         DimensionSpec("preference", "Observed coordination and communication preference", "slow"),

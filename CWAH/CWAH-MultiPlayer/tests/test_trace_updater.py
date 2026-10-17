@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 from trace_tf.updater import HybridUpdater
 from trace_tf.policy import render_policy_context
+from trace_tf.information import DecisionInformation
 from LLM.LLM import LLM
 
 
@@ -116,6 +117,54 @@ class TraceUpdaterTests(unittest.TestCase):
         state, _ = updater.update()
         self.assertEqual(state.dimensions["intent"].status, "unknown")
 
+    def test_planner_information_is_stored_and_sent_to_updater(self):
+        updater, planner = self.make_updater(planner_output())
+        updater.ledger.observe(7, observation([{"from_id": 2, "to_id": 12,
+                                                "relation_type": "HOLDS_RH"}]))
+        information = DecisionInformation(
+            planner_type="active",
+            goal="put apple on table",
+            personality="curious",
+            current_progress="Bob is visible holding apple (12)",
+            action_history=("[goexplore] <kitchen> (11)",),
+            dialogue_history=("Bob: I found the apple.",),
+            available_actions=("[goput] <apple> (12) <table> (20)",),
+            step=7,
+            source_event_ids=("e00000",),
+        ).to_dict()
+
+        state, record = updater.update(information)
+
+        stored = state.dimensions["information"].value
+        self.assertEqual(stored["goal"], "put apple on table")
+        self.assertEqual(stored["planner_type"], "active")
+        prompt = record["llm_call"]["prompt"]
+        self.assertIn("Information shared with the planner", prompt)
+        self.assertIn("put apple on table", prompt)
+        self.assertIn("Bob visibly holds <apple> (12)", prompt)
+        self.assertNotIn("$COMMITMENTS", prompt)
+
+    def test_commitments_live_inside_reliability_and_capability_is_rule_scored(self):
+        updater, planner = self.make_updater(planner_output())
+        updater.ledger.observe(0, observation())
+        message = updater.ledger.message(0, 1, 0, "I will grab the apple.", "active")
+        planner.generator.return_value = ([json.dumps(
+            planner_output(message.event_id, [message.event_id])
+        )], 0)
+        updater.update({"goal": "put apple on table"})
+        self.assertFalse(hasattr(updater, "commitments"))
+        reliability = updater.state.dimensions["reliability"].value
+        self.assertEqual(reliability["commitment_events"][0]["status"], "pending")
+
+        updater.ledger.observe(1, observation([{"from_id": 2, "to_id": 12,
+                                                "relation_type": "HOLDS_RH"}]))
+        state, _ = updater.update({"goal": "put apple on table"})
+        self.assertEqual(state.dimensions["capability"].uncertainty, 0.5)
+        self.assertEqual(
+            state.dimensions["reliability"].value["commitment_events"][0]["status"],
+            "fulfilled",
+        )
+
     def test_policy_context_is_injected_into_existing_planner_prompt(self):
         planner = LLM.__new__(LLM)
         planner.prompt_template = "$GOAL\n$PROGRESS\n$STEP\n$ACTION_HISTORY\n$ASSIGNED_PERSONALITY\n$DIALOGUE_HISTORY\n$TRACE_BELIEF\n$ACTIONS_REFINE"
@@ -136,6 +185,7 @@ class TraceUpdaterTests(unittest.TestCase):
                               belief_context="TRACE_TEST_CONTEXT")
         self.assertIn("TRACE_TEST_CONTEXT", info["raw_prompt"])
         self.assertEqual(info["trace_belief_context"], "TRACE_TEST_CONTEXT")
+        self.assertEqual(info["shared_information"]["goal"], "place apple")
 
 
 if __name__ == "__main__":

@@ -68,7 +68,10 @@ class EvidenceLedger:
                 for edge in before
             ) and source in prior_nodes:
                 self.add(step, "peer_task_outcome", {"action": "place", "object": obj["class_name"],
-                         "object_id": source, "success": True, "verified": True})
+                         "object_id": source, "relation": relation.lower(),
+                         "target_id": target,
+                         "target_class": nodes.get(target, prior_nodes.get(target, {})).get("class_name"),
+                         "success": True, "verified": True})
 
     def message(self, step, sender, receiver, text, kind):
         if sender not in (0, 1) or receiver not in (0, 1) or kind not in ("active", "reply"):

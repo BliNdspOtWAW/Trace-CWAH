@@ -26,7 +26,6 @@ class HybridUpdater:
         self.ledger = EvidenceLedger(target_id=1, peer_id=teammate_id)
         self.state = BeliefState(teammate_id)
         self.cursor = 0
-        self.commitments = {}
         self.update_log = []
         self.last_context = ""
 
@@ -57,26 +56,48 @@ class HybridUpdater:
         for event in events:
             payload = event.payload
             if event.kind == "observation":
-                nodes = payload["nodes"]
-                payload = {"visible_objects": [
-                    {"id": node["id"], "class_name": node["class_name"]}
-                    for node in nodes if node.get("category") != "Rooms"
-                ], "visible_peer_edges": [edge for edge in payload["edges"]
-                                           if edge["from_id"] == 2 or edge["to_id"] == 2]}
+                nodes = {node["id"]: node for node in payload["nodes"]}
+                facts = []
+                for edge in payload["edges"]:
+                    if edge["from_id"] != self.ledger.peer_id:
+                        continue
+                    target = nodes.get(edge["to_id"], {})
+                    relation = edge["relation_type"]
+                    if relation in ("HOLDS_RH", "HOLDS_LH"):
+                        facts.append("Bob visibly holds <{}> ({})".format(
+                            target.get("class_name", "object"), edge["to_id"]
+                        ))
+                    elif relation == "INSIDE" and target.get("category") == "Rooms":
+                        facts.append("Bob is visibly in the {}".format(target.get("class_name")))
+                payload = {"semantic_peer_facts": facts or ["Bob is not currently visible"]}
             result.append({"event_id": event.event_id, "step": event.step,
                            "kind": event.kind, "payload": payload})
         return result
 
-    def _infer(self):
-        # Keep the full legal ledger for audit; the LLM receives compact graph views
-        # plus every delivered message and observed outcome, and the latest view.
+    def _compact_prior(self):
+        result = {}
+        for name, item in self.state.dimensions.items():
+            if name in ("information", "uncertainty"):
+                continue
+            result[name] = {
+                "status": item.status,
+                "value": item.value,
+                "uncertainty": item.uncertainty,
+                "recent_evidence_ids": [e.reference for e in item.evidence[-8:]],
+            }
+        return result
+
+    def _infer(self, information):
+        # The ledger remains complete for audit. Inference receives the exact legal
+        # Information snapshot shared with the planner plus compact Bob evidence.
         observations = [e for e in self.ledger.events if e.kind == "observation"]
-        selected = [e for e in self.ledger.events if e.kind != "observation"]
+        selected = [e for e in self.ledger.events
+                    if e.kind in ("message", "peer_task_outcome")][-20:]
         if observations:
             selected.append(observations[-1])
         selected.sort(key=lambda e: int(e.event_id[1:]))
-        prompt = PROMPT.replace("$BELIEF", self.state.to_json())
-        prompt = prompt.replace("$COMMITMENTS", json.dumps(list(self.commitments.values()), ensure_ascii=False))
+        prompt = PROMPT.replace("$INFORMATION", json.dumps(information, ensure_ascii=False))
+        prompt = prompt.replace("$BELIEF", json.dumps(self._compact_prior(), ensure_ascii=False))
         prompt = prompt.replace("$EVENTS", json.dumps(self._prompt_events(selected), ensure_ascii=False))
         sampling = self.planner.sampling_params
         params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
@@ -117,7 +138,17 @@ class HybridUpdater:
                 result.append(event)
         return result
 
-    def _accept_commitments(self, proposals):
+    def _commitments_from_reliability(self):
+        reliability = self.state.dimensions["reliability"]
+        if reliability.status != "supported" or not isinstance(reliability.value, dict):
+            return {}
+        return {
+            item["commitment_id"]: json.loads(json.dumps(item))
+            for item in reliability.value.get("commitment_events", [])
+            if isinstance(item, dict) and item.get("commitment_id")
+        }
+
+    def _accept_commitments(self, proposals, commitments):
         if not isinstance(proposals, list):
             return
         by_id = self.ledger.by_id()
@@ -136,19 +167,19 @@ class HybridUpdater:
             proposed = item.get("proposed_status")
             if proposed not in ("pending", "fulfilled", "violated", "unverifiable"):
                 proposed = "unverifiable"
-            if key not in self.commitments:
-                self.commitments[key] = {
+            if key not in commitments:
+                commitments[key] = {
                     "commitment_id": key, "acceptance_event_id": key,
                     "action": action, "object": obj, "status": "pending",
                     "evidence_ids": [key], "llm_proposed_status": proposed,
                     "llm_evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
                 }
             else:
-                self.commitments[key]["llm_proposed_status"] = proposed
-                self.commitments[key]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
+                commitments[key]["llm_proposed_status"] = proposed
+                commitments[key]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
 
-    def _settle_commitments(self):
-        for commitment in self.commitments.values():
+    def _settle_commitments(self, commitments):
+        for commitment in commitments.values():
             if commitment["status"] != "pending":
                 continue
             accepted_step = self.ledger.by_id()[commitment["acceptance_event_id"]].step
@@ -166,25 +197,31 @@ class HybridUpdater:
                     commitment["evidence_ids"].append(event.event_id)
                     break
 
-    def update(self):
+    def update(self, information=None):
         new = self.ledger.since(self.cursor)
         if not new:
             return self.state, None
         before = self.state.to_dict()
         self.cursor = len(self.ledger.events)
-        self._apply("information", {"event_ids": [e.event_id for e in self.ledger.events],
-                                    "event_count": len(self.ledger.events)}, 0.0, new)
+        if information is None:
+            information = {"event_ids": [e.event_id for e in self.ledger.events],
+                           "event_count": len(self.ledger.events)}
+        else:
+            information = json.loads(json.dumps(information))
+            information["evidence_event_count"] = len(self.ledger.events)
+        self._apply("information", information, 0.0, new)
 
         call = None
         inference = {}
         try:
-            inference, call = self._infer()
+            inference, call = self._infer(information)
         except Exception as exc:
             call = {"error": "{}: {}".format(type(exc).__name__, exc),
                     "model": self.planner.lm_id, "usage": self.planner.last_usage_metadata}
 
-        self._accept_commitments(inference.get("commitments", []))
-        self._settle_commitments()
+        commitments = self._commitments_from_reliability()
+        self._accept_commitments(inference.get("commitments", []), commitments)
+        self._settle_commitments(commitments)
         proposals = inference.get("uncertainty", {})
         if not isinstance(proposals, dict):
             proposals = {}
@@ -219,24 +256,27 @@ class HybridUpdater:
         failures = sum(e.payload.get("success") is False and e.payload.get("terminal") is True for e in attempts)
         count = successes + failures
         if count:
-            u = max(_unit(proposals.get("capability")), 1.0 / (count + 1))
+            # Capability is objectively counted, so evidence volume—not an
+            # unconstrained LLM score—calibrates its uncertainty.
+            u = 1.0 / (count + 1)
             self._apply("capability", {"successes": successes, "failures": failures,
                                        "success_rate": successes / count}, u, attempts)
             uncertainties["capability"] = u
         else:
             uncertainties["capability"] = 1.0
 
-        fulfilled = sum(c["status"] == "fulfilled" for c in self.commitments.values())
-        violated = sum(c["status"] == "violated" for c in self.commitments.values())
+        fulfilled = sum(c["status"] == "fulfilled" for c in commitments.values())
+        violated = sum(c["status"] == "violated" for c in commitments.values())
         resolved = fulfilled + violated
-        u = max(_unit(proposals.get("reliability")), 1.0 / (resolved + 1)) if resolved else 1.0
-        reliability_events = [self.ledger.by_id()[eid] for commitment in self.commitments.values()
-                              for eid in commitment["evidence_ids"]]
+        u = 1.0 / (resolved + 1) if resolved else 1.0
+        reliability_events = [self.ledger.by_id()[eid] for commitment in commitments.values()
+                              for eid in commitment["evidence_ids"]
+                              if eid in self.ledger.by_id()]
         if reliability_events:
             self._apply("reliability", {
                 "fulfillments": fulfilled, "violations": violated,
                 "fulfillment_rate": fulfilled / resolved if resolved else None,
-                "commitment_events": list(self.commitments.values()),
+                "commitment_events": list(commitments.values()),
             }, u, reliability_events)
         uncertainties["reliability"] = u
 

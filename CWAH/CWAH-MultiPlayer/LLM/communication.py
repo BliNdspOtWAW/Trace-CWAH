@@ -3,6 +3,7 @@
 import re
 import time
 from pathlib import Path
+from trace_tf.information import DecisionInformation
 
 
 REPLY_TEMPLATE = (Path(__file__).with_name("prompt_Reply.txt")).read_text(encoding="utf-8")
@@ -40,26 +41,50 @@ class CommunicationModule:
     def __init__(self, planner):
         self.planner = planner
 
-    def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
-              agent_id=None, progress="Unknown", action_history=(), belief_context=""):
-        prompt = REPLY_TEMPLATE
+    def build_decision_information(
+            self, incoming_message, dialogue_history, current_skill, observation,
+            agent_id=None, progress="Unknown", action_history=(), step=0,
+            source_event_ids=()):
         observed_room, holding = observed_self_state(
             observation, agent_id if agent_id is not None else getattr(self.planner, "agent_id", None)
+        )
+        current_progress = (
+            f"Current room: {observed_room}\n"
+            f"Currently held objects: {holding}\n"
+            f"Visible relevant objects: {visible_object_summary(observation)}\n"
+            f"{progress or 'Unknown'}"
+        )
+        return DecisionInformation(
+            planner_type="reactive",
+            goal=self.planner.goal_desc or "Unknown",
+            personality=self.planner.personality or "None",
+            current_progress=current_progress,
+            action_history=tuple(action_history),
+            dialogue_history=tuple(dialogue_history),
+            available_actions=(),
+            step=int(step),
+            source_event_ids=tuple(source_event_ids),
+            current_skill=current_skill or "None",
+            incoming_message=incoming_message,
+        )
+
+    def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
+              agent_id=None, progress="Unknown", action_history=(), belief_context="",
+              decision_information=None):
+        prompt = REPLY_TEMPLATE
+        information = decision_information or self.build_decision_information(
+            incoming_message, dialogue_history, current_skill, observation,
+            agent_id=agent_id, progress=progress, action_history=action_history,
         )
         values = {
             "$AGENT_NAME": self.planner.agent_name,
             "$OPPO_NAME": self.planner.oppo_name,
-            "$ASSIGNED_PERSONALITY": self.planner.personality or "None",
-            "$GOAL": self.planner.goal_desc or "Unknown",
-            "$CURRENT_SKILL": current_skill or "None",
-            "$PROGRESS": (
-                f"Current room: {observed_room}\n"
-                f"Currently held objects: {holding}\n"
-                f"Visible relevant objects: {visible_object_summary(observation)}\n"
-                f"{progress or 'Unknown'}"
-            ),
-            "$ACTION_HISTORY": ", ".join(action_history) if action_history else "None",
-            "$DIALOGUE_HISTORY": "\n".join(dialogue_history) or "None",
+            "$ASSIGNED_PERSONALITY": information.personality,
+            "$GOAL": information.goal,
+            "$CURRENT_SKILL": information.current_skill,
+            "$PROGRESS": information.current_progress,
+            "$ACTION_HISTORY": ", ".join(information.action_history) or "None",
+            "$DIALOGUE_HISTORY": "\n".join(information.dialogue_history) or "None",
             "$TRACE_BELIEF": belief_context or "TRACE is disabled. No teammate belief is available.",
             "$INCOMING_MESSAGE": incoming_message,
         }
@@ -92,4 +117,5 @@ class CommunicationModule:
             "usage": self.planner.last_usage_metadata,
             "legacy_cost_estimate": legacy_cost,
             "latency_seconds": elapsed,
+            "shared_information": information.to_dict(),
         }
