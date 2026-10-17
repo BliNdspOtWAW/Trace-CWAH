@@ -37,8 +37,12 @@ class HybridUpdater:
                           else EvidenceSource.OWN_MESSAGE)
             elif event.kind == "own_action":
                 source = EvidenceSource.OWN_ACTION
-            elif event.kind == "peer_task_outcome":
+            elif event.kind in ("peer_task_progress", "peer_task_outcome"):
                 source = EvidenceSource.VISIBLE_PEER_OUTCOME
+            elif event.kind == "task_completion" and event.payload.get("completed_by") == "Alice":
+                source = EvidenceSource.OWN_ACTION_OUTCOME
+            elif event.kind == "task_completion":
+                source = EvidenceSource.VISIBLE_OBSERVATION
             else:
                 source = EvidenceSource.VISIBLE_OBSERVATION
             evidence.append(Evidence(source, event.step, event.kind, event.event_id))
@@ -92,7 +96,8 @@ class HybridUpdater:
         # Information snapshot shared with the planner plus compact Bob evidence.
         observations = [e for e in self.ledger.events if e.kind == "observation"]
         selected = [e for e in self.ledger.events
-                    if e.kind in ("message", "peer_task_outcome")][-20:]
+                    if e.kind in ("message", "peer_task_progress", "peer_task_outcome",
+                                  "task_completion")][-20:]
         if observations:
             selected.append(observations[-1])
         selected.sort(key=lambda e: int(e.event_id[1:]))
@@ -130,7 +135,9 @@ class HybridUpdater:
         for event in events:
             if event.kind == "message" and event.payload["sender"] == 2:
                 result.append(event)
-            elif event.kind == "peer_task_outcome":
+            elif event.kind in ("peer_task_progress", "peer_task_outcome"):
+                result.append(event)
+            elif event.kind == "task_completion" and event.payload.get("completed_by") == "Bob":
                 result.append(event)
             elif event.kind == "observation" and any(
                 node["id"] == 2 for node in event.payload["nodes"]
@@ -159,24 +166,31 @@ class HybridUpdater:
             accepted = by_id.get(key)
             action = item.get("action")
             obj = item.get("object")
+            subtask_id = item.get("subtask_id")
             if (not accepted or accepted.kind != "message" or accepted.payload["sender"] != 2
                     or action not in ("grab", "place", "search")
                     or (obj is not None and not isinstance(obj, str))
+                    or (action in ("grab", "place")
+                        and subtask_id not in self.ledger.known_subtask_ids())
+                    or (action == "search" and subtask_id is not None
+                        and subtask_id not in self.ledger.known_subtask_ids())
                     or not self._valid_events(item.get("evidence_ids", []))):
                 continue
+            commitment_id = "{}:{}:{}".format(key, subtask_id or "none", action)
             proposed = item.get("proposed_status")
             if proposed not in ("pending", "fulfilled", "violated", "unverifiable"):
                 proposed = "unverifiable"
-            if key not in commitments:
-                commitments[key] = {
-                    "commitment_id": key, "acceptance_event_id": key,
-                    "action": action, "object": obj, "status": "pending",
+            if commitment_id not in commitments:
+                commitments[commitment_id] = {
+                    "commitment_id": commitment_id, "acceptance_event_id": key,
+                    "subtask_id": subtask_id, "action": action, "object": obj,
+                    "status": "pending",
                     "evidence_ids": [key], "llm_proposed_status": proposed,
                     "llm_evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
                 }
             else:
-                commitments[key]["llm_proposed_status"] = proposed
-                commitments[key]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
+                commitments[commitment_id]["llm_proposed_status"] = proposed
+                commitments[commitment_id]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
 
     def _settle_commitments(self, commitments):
         for commitment in commitments.values():
@@ -185,17 +199,76 @@ class HybridUpdater:
             accepted_step = self.ledger.by_id()[commitment["acceptance_event_id"]].step
             for event in self.ledger.events:
                 outcome = event.payload
-                if (event.step < accepted_step or event.kind != "peer_task_outcome"
-                        or not outcome.get("verified") or outcome.get("action") != commitment["action"]
-                        or (commitment["object"] and outcome.get("object") != commitment["object"])):
+                if event.step < accepted_step:
                     continue
-                if outcome.get("success") is True:
+                matched = False
+                if event.kind == "peer_task_progress":
+                    task = outcome.get("task") or {}
+                    matched = (
+                        commitment["action"] == "grab"
+                        and task.get("subtask_id") == commitment.get("subtask_id")
+                    )
+                elif event.kind == "peer_task_outcome":
+                    task = outcome.get("task") or {}
+                    matched = (
+                        outcome.get("verified")
+                        and outcome.get("action") == commitment["action"]
+                        and task.get("subtask_id") == commitment.get("subtask_id")
+                    )
+                elif event.kind == "task_completion" and outcome.get("completed_by") == "Bob":
+                    task = outcome.get("task") or {}
+                    matched = (
+                        commitment["action"] == "place"
+                        and task.get("subtask_id") == commitment.get("subtask_id")
+                    )
+                if not matched:
+                    continue
+                if event.kind in ("peer_task_progress", "task_completion"):
+                    commitment["status"] = "fulfilled"
+                elif outcome.get("success") is True:
                     commitment["status"] = "fulfilled"
                 elif outcome.get("success") is False and outcome.get("terminal") is True:
                     commitment["status"] = "violated"
                 if commitment["status"] != "pending":
                     commitment["evidence_ids"].append(event.event_id)
                     break
+
+    def _capability_executions(self):
+        """Build task-level Bob execution records from legal progress/completion evidence."""
+        executions = {}
+        for event in self.ledger.events:
+            payload = event.payload
+            task = payload.get("task") or {}
+            key = task.get("subtask_id")
+            if not key:
+                continue
+            if event.kind == "peer_task_progress":
+                item = executions.setdefault(key, {
+                    "subtask_id": key, "task": task, "actor": "Bob",
+                    "status": "in_progress", "outcome": "unknown",
+                    "evidence_ids": [],
+                })
+                item["evidence_ids"].append(event.event_id)
+                item["observed_actions"] = list(dict.fromkeys(
+                    item.get("observed_actions", []) + [payload.get("observed_action")]
+                ))
+            elif event.kind == "task_completion":
+                completed_by = payload.get("completed_by", "unknown")
+                item = executions.get(key)
+                if completed_by == "Bob":
+                    item = item or {
+                        "subtask_id": key, "task": task, "actor": "Bob",
+                        "evidence_ids": [], "observed_actions": [],
+                    }
+                    executions[key] = item
+                    item.update({"status": "completed", "outcome": "success",
+                                 "completed_by": "Bob"})
+                    item["evidence_ids"].append(event.event_id)
+                elif item is not None and item["status"] == "in_progress":
+                    item.update({"status": "abandoned", "outcome": "unknown",
+                                 "completed_by": completed_by})
+                    item["evidence_ids"].append(event.event_id)
+        return executions
 
     def update(self, information=None):
         new = self.ledger.since(self.cursor)
@@ -251,16 +324,21 @@ class HybridUpdater:
                 prior = self.state.dimensions[dimension]
                 uncertainties[dimension] = 1.0 if prior.status == "unknown" or prior.uncertainty is None else prior.uncertainty
 
-        attempts = [e for e in self.ledger.events if e.kind == "peer_task_outcome" and e.payload.get("verified")]
-        successes = sum(e.payload.get("success") is True for e in attempts)
-        failures = sum(e.payload.get("success") is False and e.payload.get("terminal") is True for e in attempts)
+        executions = self._capability_executions()
+        successes = sum(item.get("outcome") == "success" for item in executions.values())
+        failures = sum(item.get("outcome") == "failure" for item in executions.values())
         count = successes + failures
-        if count:
+        capability_events = [self.ledger.by_id()[eid] for item in executions.values()
+                             for eid in item.get("evidence_ids", [])
+                             if eid in self.ledger.by_id()]
+        if capability_events:
             # Capability is objectively counted, so evidence volume—not an
             # unconstrained LLM score—calibrates its uncertainty.
-            u = 1.0 / (count + 1)
+            u = 1.0 / (count + 1) if count else 1.0
             self._apply("capability", {"successes": successes, "failures": failures,
-                                       "success_rate": successes / count}, u, attempts)
+                                       "success_rate": successes / count if count else None,
+                                       "task_execution_events": list(executions.values())},
+                        u, capability_events)
             uncertainties["capability"] = u
         else:
             uncertainties["capability"] = 1.0

@@ -10,7 +10,8 @@ def render_policy_context(state, ledger):
     # Information is already rendered through the planner's normal Goal/Progress/
     # History fields. Inject only the inferred teammate belief here.
     recent = [event.to_dict() for event in ledger.events
-              if event.kind in ("message", "peer_task_outcome")][-8:]
+              if event.kind in ("message", "peer_task_progress", "peer_task_outcome",
+                                "task_completion")][-8:]
     values = {}
     for name in ("intent", "capability", "preference", "reliability"):
         item = dims[name]
@@ -58,7 +59,8 @@ def render_reply_context(state, ledger):
         "value": uncertainty.value,
     }
     recent = [event.to_dict() for event in ledger.events
-              if event.kind in ("message", "peer_task_outcome")][-4:]
+              if event.kind in ("message", "peer_task_progress", "peer_task_outcome",
+                                "task_completion")][-4:]
     return (
         "Use this belief, derived from the same Information shown above, when relevant. "
         "Treat uncertain inferences cautiously and do not present them as verified facts.\n"

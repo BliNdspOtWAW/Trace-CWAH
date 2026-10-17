@@ -247,12 +247,29 @@ class LLM:
         self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
         self.goal_desc, self.goal_location_with_r = self.goal2description(unsatisfied, None)
 
-    def refresh_goal(self, goal_location, unsatisfied, active_subtasks=None):
+    def refresh_goal(self, goal_location, unsatisfied, active_subtasks=None,
+                     completed_subtasks=None):
         """Refresh public task text without resetting personality or histories."""
         self.goal_location = goal_location
         self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
         self.active_subtasks = list(active_subtasks or [])
         self.goal_desc, self.goal_location_with_r = self.goal2description(unsatisfied, None)
+        completed = list(completed_subtasks or [])
+        if completed:
+            recent = []
+            for item in completed[-20:]:
+                recent.append(
+                    "[{}] <{}> ({}) {} <{}> ({}) by {}".format(
+                        item.get('subtask_id', 'unknown-subtask'),
+                        item.get('object_class', 'object'), item.get('object_id'),
+                        item.get('relation', 'at'), item.get('target_class', 'target'),
+                        item.get('target_id'), item.get('completed_by', 'unknown'),
+                    )
+                )
+            self.goal_desc += (
+                " Completed subtask history (already satisfied; do not repeat unless "
+                "listed again as active): " + "; ".join(recent) + "."
+            )
 
     def goal2description(self, goals, goal_location_room):
         map_rel_to_pred = {'inside': 'into', 'on': 'onto'}
@@ -283,8 +300,11 @@ class LLM:
                     object_text = f"<{obj['class_name']}> ({object_id})"
                 else:
                     object_text = f"{count} {obj1}{'s' if count > 1 else ''}"
+                subtask_prefix = (
+                    f"[{record['subtask_id']}] " if record.get('subtask_id') else ""
+                )
                 descriptions.append(
-                    f"put {object_text} {map_rel_to_pred[relation]} "
+                    f"{subtask_prefix}put {object_text} {map_rel_to_pred[relation]} "
                     f"<{target['class_name']}> ({target_id})"
                 )
         if not descriptions:

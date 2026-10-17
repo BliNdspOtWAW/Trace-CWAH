@@ -35,11 +35,17 @@ $ACTION_HISTORY
 Available high-level actions:
 $ACTIONS_REFINE
 
-Select exactly one available action, either a physical action or [send_message].
-If you select a physical action, leave the message empty.
-If you select [send_message], include a concise message and output [send_message] as the action.
+Select exactly one available action, either a physical action or [send_message]. You cannot perform both in the same step.
 
-Output format:
+If you select a physical action, leave <message> empty.
+If you select [send_message], provide a concise message and output [send_message] as the action.
+
+Output format (physical action):
 <cot>Brief task-grounded reason for the chosen action.</cot>
-<message>Message to your teammate, only if sending one.</message>
-<action>Exactly one available action.</action>
+<message></message>
+<action>Exactly one available physical action.</action>
+
+Output format ([send_message]):
+<cot>Brief task-grounded reason for the chosen action.</cot>
+<message>A concise message to your teammate.</message>
+<action>[send_message]</action>

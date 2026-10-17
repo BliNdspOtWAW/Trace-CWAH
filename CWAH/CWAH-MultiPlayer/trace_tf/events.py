@@ -27,14 +27,48 @@ class EvidenceLedger:
         self.events: List[TraceEvent] = []
         self._observed_steps = set()
         self._prior_observation: Optional[Dict[str, Any]] = None
+        self._active_tasks: List[Dict[str, Any]] = []
 
     def add(self, step, kind, payload):
-        if kind not in ("observation", "message", "own_action", "peer_task_outcome", "own_outcome"):
+        if kind not in ("observation", "message", "own_action", "peer_task_progress",
+                        "peer_task_outcome", "task_completion", "own_outcome"):
             raise ValueError("unsupported TRACE evidence kind")
         event = TraceEvent("e{:05d}".format(len(self.events)), int(step), kind,
                            _json_copy(payload))
         self.events.append(event)
         return event
+
+    def set_active_tasks(self, tasks):
+        """Provide only the public active-task snapshot used by both agents."""
+        self._active_tasks = _json_copy(list(tasks or []))
+
+    def _task_for_object(self, object_id):
+        return next(
+            (task for task in self._active_tasks if task.get("object_id") == object_id),
+            None,
+        )
+
+    def known_subtask_ids(self):
+        """IDs visible on the public task board or its completion history."""
+        result = {task.get("subtask_id") for task in self._active_tasks}
+        result.update(
+            (event.payload.get("task") or {}).get("subtask_id")
+            for event in self.events if event.kind == "task_completion"
+        )
+        return {item for item in result if isinstance(item, str) and item}
+
+    @staticmethod
+    def _task_payload(task):
+        if not task:
+            return None
+        return {
+            "subtask_id": task.get("subtask_id"),
+            "object_id": task.get("object_id"),
+            "object_class": task.get("object_class"),
+            "relation": task.get("relation"),
+            "target_id": task.get("target_id"),
+            "target_class": task.get("target_class"),
+        }
 
     def observe(self, step, observation):
         """Only the target's partial observation, never env.full_graph."""
@@ -61,17 +95,33 @@ class EvidenceLedger:
             if obj is None:
                 continue
             if source == self.peer_id and relation.startswith("HOLDS"):
+                task = self._task_for_object(target)
+                if task:
+                    self.add(step, "peer_task_progress", {
+                        "actor": "Bob", "status": "in_progress",
+                        "observed_action": "grab", "task": self._task_payload(task),
+                    })
                 self.add(step, "peer_task_outcome", {"action": "grab", "object": obj["class_name"],
                          "object_id": target, "success": True, "verified": True})
             elif relation in ("ON", "INSIDE") and any(
                 edge[0] == self.peer_id and edge[1] == source and edge[2].startswith("HOLDS")
                 for edge in before
             ) and source in prior_nodes:
+                task = self._task_for_object(source)
                 self.add(step, "peer_task_outcome", {"action": "place", "object": obj["class_name"],
                          "object_id": source, "relation": relation.lower(),
                          "target_id": target,
                          "target_class": nodes.get(target, prior_nodes.get(target, {})).get("class_name"),
+                         "task": self._task_payload(task) if task else None,
                          "success": True, "verified": True})
+
+    def task_completion(self, step, task, completed_by="unknown"):
+        if completed_by not in ("Alice", "Bob", "unknown"):
+            raise ValueError("completed_by must be Alice, Bob, or unknown")
+        return self.add(step, "task_completion", {
+            "task": self._task_payload(task),
+            "completed_by": completed_by,
+        })
 
     def message(self, step, sender, receiver, text, kind):
         if sender not in (0, 1) or receiver not in (0, 1) or kind not in ("active", "reply"):

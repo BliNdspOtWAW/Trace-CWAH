@@ -8,6 +8,7 @@ from tqdm import tqdm
 import time
 import json
 import atexit
+import re
 
 # @ray.remote
 class ArenaMP(object):
@@ -393,6 +394,13 @@ class ArenaMP(object):
         except Exception as e:
             print("Exception occurs when performing action: ", dict_actions)
             raise Exception
+        continuous_event = step_info[3].get('continuous_subtasks', {})
+        completed = continuous_event.get('completed', [])
+        if completed:
+            attribution = self._attribute_completed_subtasks(completed, dict_actions)
+            for agent in self.agents:
+                if hasattr(agent, 'record_task_completions'):
+                    agent.record_task_completions(completed, attribution, self.env.steps)
         post_step_observations = self.env.get_observations()
         if self.agents and hasattr(self.agents[0], "observe_trace_outcome"):
             self.agents[0].observe_trace_outcome(post_step_observations[0], self.env.steps)
@@ -400,6 +408,28 @@ class ArenaMP(object):
             step_info[4], step_info[2], observations=post_step_observations
         )
         return step_info, dict_actions, dict_info
+
+    @staticmethod
+    def _attribute_completed_subtasks(completed, actions):
+        """Use public completion plus Alice's own action; never expose Bob's action."""
+        result = {}
+        for task in completed:
+            expected = 'putin' if task.get('relation') == 'inside' else 'putback'
+            own_action = actions.get(0)
+            ids = ([int(value) for value in re.findall(r'\((\d+)\)', own_action)]
+                   if isinstance(own_action, str) else [])
+            done_by_alice = (
+                isinstance(own_action, str)
+                and own_action.startswith('[' + expected + ']')
+                and len(ids) >= 2
+                and ids[0] == task.get('object_id')
+                and ids[-1] == task.get('target_id')
+            )
+            # Continuous C-WAH has exactly Alice and Bob and no exogenous task
+            # executor. A newly completed public task not caused by Alice is
+            # therefore attributable to Bob by exclusion.
+            result[task.get('subtask_id')] = 'Alice' if done_by_alice else 'Bob'
+        return result
 
     def process_messages(self, messages, done=False, observations=None):
         """Deliver active messages and at most one free reply per active message."""

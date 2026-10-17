@@ -21,15 +21,27 @@ planner: goal/current subtasks, personality, current observation and progress,
 action history, dialogue history, and currently available high-level actions.
 Information is this current planner context, not an inference about what Bob
 knows. `events.py` separately keeps the complete auditable ledger of Alice's
-legal observations, messages, own actions, and directly visible peer outcomes.
+legal observations, messages, own actions, directly visible peer progress, and
+public subtask completions. A completion records the concrete subtask and its
+actor. In the two-agent Continuous C-WAH runtime, attribution uses the public
+completion plus Alice's own action: an exact matching Alice placement is hers;
+otherwise completion is attributed to Bob by exclusion. Bob's private runtime
+action is never copied into Alice's TRACE evidence.
 
 `updater.py` receives the shared Information plus the prior teammate belief and
 makes at most one joint LLM call when new evidence is consumed before Alice's
 next active or message-triggered reactive planning call. The LLM extracts
 tentative Intent, Preference, explicit commitment candidates, and four
 uncertainty proposals. Intent does not require a commitment or proof that an
-action finished. Capability and commitment fulfillment are settled by rules
-using verifiable evidence. Commitments are stored only under Reliability beside
+action finished, and a completed referenced task must not remain a current
+Intent without newer evidence. Capability keeps task-execution records with
+`in_progress`, `completed`, or `abandoned` status and a separate `success`,
+`failure`, or `unknown` outcome. Visible task-related peer activity starts an
+in-progress record; only an attributable complete subtask counts as success.
+Alice completing a task does not imply Bob failed. Commitment fulfillment is
+also settled by rules using verifiable evidence. Every concrete grab/place
+commitment is bound to the public `subtask_id`, so a different task involving
+the same object class cannot fulfill it. Commitments are stored only under Reliability beside
 its verified fulfillment rate; they are not a seventh belief dimension or a
 separate plan state. Pending or unverified commitments do not enter that rate.
 Each uncertainty is in `[0,1]`, where 1 means unknown; the overall score is the
@@ -47,6 +59,12 @@ profile and private plan are not input to TRACE. Full legal events and
 before/after snapshots are saved under `saved_info['trace']` in the episode
 log. Planner and updater call records also save `shared_information`, making it
 possible to verify that both received the same decision context.
+
+Continuous agents retain a full completed-subtask history separately from the
+active task list. The planner sees the most recent 20 records, explicitly marked
+as historical and already satisfied, while the complete history remains
+available for logging and analysis. A historical task is actionable only if a
+new Continuous subtask activates that object/relation/target again.
 The implementation is a training-free research prototype, not a calibrated
 probabilistic estimator. It must not be treated as a fully verified benchmark
 result without an episode-level run.

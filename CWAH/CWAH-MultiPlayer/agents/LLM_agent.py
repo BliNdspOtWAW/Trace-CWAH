@@ -34,6 +34,7 @@ class LLM_agent:
 		self.roomname2id = {}
 		self.unsatisfied = {}
 		self.active_goals = []
+		self.completed_goals = []
 		self.steps = 0
 		# self.location = None
 		# self.last_location = None
@@ -76,6 +77,26 @@ class LLM_agent:
 
 	def _node_matches_goal_object(self, node, object_token):
 		return node['id'] == int(object_token) if object_token.isdigit() else node['class_name'] == object_token
+
+	def _matches_unsatisfied_goal(self, node):
+		return any(
+			count > 0 and self._node_matches_goal_object(node, self._parse_goal(predicate)[1])
+			for predicate, count in getattr(self, 'unsatisfied', {}).items()
+		)
+
+	def _remove_cached_object(self, object_id):
+		"""Invalidate every remembered room location for one observed/stale object."""
+		for room, objects in getattr(self, 'ungrabbed_objects', {}).items():
+			if objects is not None:
+				self.ungrabbed_objects[room] = [item for item in objects if item['id'] != object_id]
+
+	def _prune_ungrabbed_memory(self):
+		"""Keep remote memory, but only expose objects relevant to active unfinished goals."""
+		for room, objects in getattr(self, 'ungrabbed_objects', {}).items():
+			if objects is not None:
+				self.ungrabbed_objects[room] = [
+					item for item in objects if self._matches_unsatisfied_goal(item)
+				]
 
 	def _refresh_active_goals(self, goal, subtask_records=None):
 		records = {
@@ -163,6 +184,7 @@ class LLM_agent:
 		if target_object_id not in self.id2node or target_object_id not in [w['id'] for w in self.ungrabbed_objects[target_object_room]] or target_object_id in [x['id'] for x in self.opponent_grabbed_objects]:
 			if self.debug:
 				print(f"not here any more!")
+			self._remove_cached_object(target_object_id)
 			self.plan = None
 			return None
 		if f"{target_object_name} ({target_object_id})" in self.reachable_objects:
@@ -295,6 +317,7 @@ class LLM_agent:
 		satisfied, unsatisfied = self.check_progress(observation, goal)
 		self.unsatisfied = unsatisfied
 		self.satisfied = satisfied
+		self._prune_ungrabbed_memory()
 		obs = self.filter_graph(observation)
 		self.grabbed_objects = []
 		opponent_grabbed_objects = []
@@ -316,21 +339,16 @@ class LLM_agent:
 		unchecked_containers = []
 		ungrabbed_objects = []
 		for x in obs['nodes']:
+			# A direct observation supersedes every remembered room location for
+			# this object. The current-room cache is rebuilt below when relevant.
+			self._remove_cached_object(x['id'])
 			if x['id'] in self.grabbed_objects or x['id'] in [w['id'] for w in opponent_grabbed_objects]:
-				for room, ungrabbed in self.ungrabbed_objects.items():
-					if ungrabbed is None: continue
-					j = None
-					for i, ungrab in enumerate(ungrabbed):
-						if x['id'] == ungrab['id']:
-							j = i
-					if j is not None:
-						ungrabbed.pop(j)
 				continue
 			self.id_inside_room[x['id']] = self.current_room['class_name']
 			target_ids = {goal['target_id'] for goal in self.active_goals}
 			if x['class_name'] in self.containers_name and 'CLOSED' in x['states'] and x['id'] not in target_ids:
 				unchecked_containers.append(x)
-			if (any(self._node_matches_goal_object(x, self._parse_goal(g)[1]) for g in self.unsatisfied)
+			if (self._matches_unsatisfied_goal(x)
 					and all([x['id'] != y['id'] for y in self.satisfied])
 					and 'GRABBABLE' in x['properties']
 					and x['id'] not in self.grabbed_objects
@@ -443,14 +461,27 @@ class LLM_agent:
 		if not active:
 			self.active_goals = []
 			self.unsatisfied = {}
+			self.goal_objects_name = []
+			self._prune_ungrabbed_memory()
+			if self.trace is not None and hasattr(self.trace, 'ledger'):
+				self.trace.ledger.set_active_tasks([])
+			if self.goal_location is not None:
+				self.LLM.refresh_goal(
+					self.goal_location, {}, [], getattr(self, 'completed_goals', [])
+				)
 			return
 		self._refresh_active_goals(active, subtask_records)
+		if self.trace is not None and hasattr(self.trace, 'ledger'):
+			self.trace.ledger.set_active_tasks(subtask_records)
+		self.unsatisfied = {key: value[0] for key, value in active.items()}
+		self._prune_ungrabbed_memory()
 		first = self.active_goals[0]
 		known_nodes = getattr(self, 'id2node', {})
 		first_target = known_nodes.get(first['target_id'])
 		first_target_class = first.get('target_class') or (first_target or {}).get('class_name') or 'target'
 		self.goal_location = f"<{first_target_class}> ({first['target_id']})"
 		self.goal_location_id = first['target_id']
+		self.goal_objects_name = []
 		for item in self.active_goals:
 			self.id_inside_room.setdefault(item['target_id'], self.rooms_name[:])
 			if item.get('object_class'):
@@ -466,8 +497,24 @@ class LLM_agent:
 			if target_class:
 				self.goal_objects_name.append(target_class)
 		self.goal_objects_name = list(dict.fromkeys(self.goal_objects_name))
-		self.unsatisfied = {key: value[0] for key, value in active.items()}
-		self.LLM.refresh_goal(self.goal_location, self.unsatisfied, subtask_records)
+		self.LLM.refresh_goal(
+			self.goal_location, self.unsatisfied, subtask_records,
+			getattr(self, 'completed_goals', [])
+		)
+
+	def record_task_completions(self, completed, completed_by=None, step=None):
+		"""Retain public completion history; TRACE receives no hidden graph state."""
+		for task in completed or []:
+			record = dict(task)
+			record['completed_by'] = (completed_by or {}).get(task.get('subtask_id'), 'unknown')
+			if not any(item.get('subtask_id') == record.get('subtask_id')
+					   for item in self.completed_goals):
+				self.completed_goals.append(record)
+			if self.trace is not None:
+				self.trace.ledger.task_completion(
+					step if step is not None else self.steps,
+					task, record['completed_by'],
+				)
 
 	def reply_to_message(self, message, observation):
 		room = self.current_room['class_name'] if self.current_room else None
@@ -513,6 +560,7 @@ class LLM_agent:
         # room_info: [{'id': 1, 'category': 'Characters', 'class_name': 'character', 'prefab_name': 'Female1', 'obj_transform': {'position': [6.15288, 1.25, -2.417234], 'rotation': [0.0, -0.8562313, 0.0, 0.516592741], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [6.19369459, 0.9142707, -2.387253], 'size': [0.806426048, 1.81487966, 0.94945]}, 'properties': [], 'states': []}, {'id': 2, 'category': 'Characters', 'class_name': 'character', 'prefab_name': 'Male1', 'obj_transform': {'position': [11.0559931, 1.25, -4.948724], 'rotation': [0.0, -0.6762676, 0.0, 0.73665607], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [11.0793667, 2.121052, -4.95072556], 'size': [0.628577232, 1.86971855, 1.38765383]}, 'properties': [], 'states': []}, {'id': 11, 'category': 'Rooms', 'class_name': 'kitchen', 'prefab_name': 'PRE_ROO_Kitchen_01', 'obj_transform': {'position': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0, 1.0], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [1.25, 1.25, 0.0], 'size': [8.0, 3.0, 8.0]}, 'properties': [], 'states': []}, {'id': 172, 'category': 'Rooms', 'class_name': 'bathroom', 'prefab_name': 'PRE_ROO_Bathroom_03', 'obj_transform': {'position': [1.228, 0.0, 6.25], 'rotation': [0.0, 0.7071068, 0.0, 0.7071067], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [2.478, 1.25, 6.25], 'size': [5.5, 3.0, 5.5]}, 'properties': [], 'states': []}, {'id': 210, 'category': 'Rooms', 'class_name': 'bedroom', 'prefab_name': 'PRE_ROO_Bedroom_03', 'obj_transform': {'position': [5.0, 0.0, -2.456], 'rotation': [0.0, 0.0, 0.0, 1.0], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [7.5, 1.25, -3.706], 'size': [5.5, 3.0, 5.5]}, 'properties': [], 'states': []}, {'id': 267, 'category': 'Rooms', 'class_name': 'livingroom', 'prefab_name': 'PRE_ROO_Livingroom_08', 'obj_transform': {'position': [11.25, 0.0, -6.1842], 'rotation': [0.0, -0.7071068, 0.0, 0.7071067], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [13.75, 1.25, -4.9342], 'size': [8.0, 3.0, 8.0]}, 'properties': [], 'states': []}]
         # goal: {'on_pudding_<coffeetable> (268)': [1, True, 2], 'on_juice_<coffeetable> (268)': [1, True, 2], 'on_apple_<coffeetable> (268)': [1, True, 2], 'on_cupcake_<coffeetable> (268)': [2, True, 2]}
 		self.steps = 0
+		self.completed_goals = []
 		self.containers_name = containers_name
 		self.goal_objects_name = goal_objects_name
 		self.rooms_name = rooms_name

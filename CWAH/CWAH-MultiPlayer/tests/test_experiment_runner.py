@@ -181,6 +181,65 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertIn("pudding", agent.goal_objects_name)
         agent.LLM.refresh_goal.assert_called_once()
 
+    def test_completed_subtask_is_retained_separately_from_active_tasks(self):
+        agent = LLM_agent.__new__(LLM_agent)
+        agent.completed_goals = []
+        agent.trace = None
+        completed = {
+            "subtask_id": "s1", "object_id": 10, "object_class": "apple",
+            "relation": "on", "target_id": 72, "target_class": "kitchentable",
+            "status": "completed", "completed_step": 4,
+        }
+
+        agent.record_task_completions([completed], {"s1": "Bob"}, step=4)
+        agent.record_task_completions([completed], {"s1": "Bob"}, step=4)
+
+        self.assertEqual(len(agent.completed_goals), 1)
+        self.assertEqual(agent.completed_goals[0]["completed_by"], "Bob")
+
+    def test_planner_marks_completed_subtasks_as_history_not_active_goal(self):
+        planner = LLM.__new__(LLM)
+        planner.id2node = {
+            10: {"id": 10, "class_name": "apple"},
+            72: {"id": 72, "class_name": "kitchentable"},
+            103: {"id": 103, "class_name": "fridge"},
+        }
+        completed = [{
+            "subtask_id": "s1", "object_id": 10, "object_class": "apple",
+            "relation": "on", "target_id": 72, "target_class": "kitchentable",
+            "completed_by": "Bob",
+        }]
+
+        planner.refresh_goal(
+            "<fridge> (103)", {"inside_10_103": 1},
+            [{"relation": "inside", "object_id": 10, "object_class": "apple",
+              "target_id": 103, "target_class": "fridge"}], completed,
+        )
+
+        self.assertIn("put <apple> (10) into <fridge> (103)", planner.goal_desc)
+        self.assertIn("[s1]", planner.goal_desc)
+        self.assertIn("already satisfied; do not repeat", planner.goal_desc)
+        self.assertIn("<apple> (10) on <kitchentable> (72) by Bob", planner.goal_desc)
+
+    def test_completion_attribution_uses_only_alice_action_and_public_completion(self):
+        from algos.arena_mp2 import ArenaMP
+
+        task = {
+            "subtask_id": "s1", "object_id": 10, "relation": "on",
+            "target_id": 72,
+        }
+        alice = ArenaMP._attribute_completed_subtasks(
+            [task], {0: "[putback] <apple> (10) <kitchentable> (72)",
+                     1: "[walktowards] <bedroom> (210)"},
+        )
+        bob = ArenaMP._attribute_completed_subtasks(
+            [task], {0: "[walktowards] <bedroom> (210)",
+                     1: "PRIVATE_BOB_ACTION_IS_NOT_NEEDED"},
+        )
+
+        self.assertEqual(alice["s1"], "Alice")
+        self.assertEqual(bob["s1"], "Bob")
+
     def test_continuous_exact_inside_goal_produces_putin(self):
         agent = LLM_agent.__new__(LLM_agent)
         agent.rooms_name = ["kitchen", "livingroom"]
@@ -204,6 +263,55 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertEqual(
             agent.goput(), "[putin] <apple> (10) <fridge> (103)"
         )
+
+    def test_continuous_goal_refresh_prunes_obsolete_object_candidates(self):
+        agent = LLM_agent.__new__(LLM_agent)
+        agent.goal_location = "<kitchentable> (72)"
+        agent.goal_location_id = 72
+        agent.id_inside_room = {72: "kitchen", 368: "kitchen", 369: "bedroom"}
+        agent.rooms_name = ["kitchen", "bedroom"]
+        agent.goal_objects_name = ["poundcake", "cupcake", "kitchentable"]
+        agent.id2node = {
+            72: {"id": 72, "class_name": "kitchentable"},
+            368: {"id": 368, "class_name": "cupcake"},
+            369: {"id": 369, "class_name": "poundcake"},
+        }
+        agent.ungrabbed_objects = {
+            "kitchen": [agent.id2node[368], agent.id2node[369]],
+            "bedroom": [agent.id2node[369]],
+        }
+        agent.plan = None
+        agent.action_history = []
+        agent.dialogue_history = []
+        agent.trace = None
+        agent.LLM = SimpleNamespace(refresh_goal=Mock())
+
+        agent.update_task_goal(
+            {"on_368_<kitchentable> (72)": [1, True, 2]},
+            [{"relation": "on", "object_id": 368, "object_class": "cupcake",
+              "target_id": 72, "target_class": "kitchentable"}],
+        )
+
+        self.assertEqual([item["id"] for item in agent.ungrabbed_objects["kitchen"]], [368])
+        self.assertEqual(agent.ungrabbed_objects["bedroom"], [])
+        self.assertEqual(agent.goal_objects_name, ["cupcake", "kitchentable"])
+
+    def test_invalid_grab_forgets_stale_locations_before_replanning(self):
+        agent = LLM_agent.__new__(LLM_agent)
+        stale = {"id": 369, "class_name": "poundcake"}
+        agent.plan = "[gograb] <poundcake> (369)"
+        agent.debug = False
+        agent.grabbed_objects = []
+        agent.opponent_grabbed_objects = []
+        agent.current_room = {"class_name": "bedroom"}
+        agent.id_inside_room = {369: "bedroom"}
+        agent.id2node = {369: stale}
+        agent.ungrabbed_objects = {"kitchen": [stale], "bedroom": []}
+        agent.reachable_objects = []
+
+        self.assertIsNone(agent.gograb())
+        self.assertIsNone(agent.plan)
+        self.assertEqual(agent.ungrabbed_objects, {"kitchen": [], "bedroom": []})
 
     def test_port_lock_blocks_another_local_runner(self):
         with tempfile.TemporaryDirectory() as temporary:

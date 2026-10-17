@@ -29,12 +29,21 @@ def planner_output(acceptance_id=None, evidence_ids=()):
         "intent": {"action": "gograb", "target": "apple", "evidence_ids": list(evidence_ids)},
         "preference": {"description": None, "evidence_ids": []},
         "commitments": ([{
-            "acceptance_event_id": acceptance_id, "action": "grab", "object": "apple",
+            "acceptance_event_id": acceptance_id,
+            "subtask_id": "subtask-apple-table",
+            "action": "grab", "object": "apple",
             "evidence_ids": [acceptance_id], "proposed_status": "fulfilled",
         }] if acceptance_id else []),
         "uncertainty": {"intent": 0.0, "capability": 0.0,
                         "preference": 0.0, "reliability": 0.0},
     }
+
+
+TASK = {
+    "subtask_id": "subtask-apple-table", "object_id": 12,
+    "object_class": "apple", "relation": "on", "target_id": 20,
+    "target_class": "kitchentable",
+}
 
 
 class TraceUpdaterTests(unittest.TestCase):
@@ -63,6 +72,7 @@ class TraceUpdaterTests(unittest.TestCase):
 
     def test_self_report_does_not_fulfill_commitment_but_visible_grab_does(self):
         updater, planner = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
         updater.ledger.observe(0, observation())
         message = updater.ledger.message(0, 1, 0, "Alice, I will grab the apple.", "active")
         planner.generator.return_value = ([json.dumps(planner_output(message.event_id, [message.event_id]))], 0)
@@ -79,6 +89,7 @@ class TraceUpdaterTests(unittest.TestCase):
 
         updater.ledger.observe(2, observation([{"from_id": 2, "to_id": 12,
                                                  "relation_type": "HOLDS_RH"}]))
+        updater.ledger.task_completion(3, TASK, "Bob")
         state, _ = updater.update()
         self.assertEqual(state.dimensions["capability"].value["success_rate"], 1.0)
         self.assertEqual(state.dimensions["reliability"].value["fulfillment_rate"], 1.0)
@@ -88,6 +99,7 @@ class TraceUpdaterTests(unittest.TestCase):
     def test_silence_and_unaccepted_request_are_not_violations(self):
         updater, planner = self.make_updater(planner_output())
         updater.ledger.observe(0, observation())
+        updater.ledger.set_active_tasks([TASK])
         updater.ledger.message(0, 0, 1, "Please search the kitchen", "active")
         state, _ = updater.update()
         self.assertEqual(planner.generator.call_count, 1)
@@ -146,6 +158,7 @@ class TraceUpdaterTests(unittest.TestCase):
 
     def test_commitments_live_inside_reliability_and_capability_is_rule_scored(self):
         updater, planner = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
         updater.ledger.observe(0, observation())
         message = updater.ledger.message(0, 1, 0, "I will grab the apple.", "active")
         planner.generator.return_value = ([json.dumps(
@@ -158,12 +171,83 @@ class TraceUpdaterTests(unittest.TestCase):
 
         updater.ledger.observe(1, observation([{"from_id": 2, "to_id": 12,
                                                 "relation_type": "HOLDS_RH"}]))
+        updater.ledger.task_completion(2, TASK, "Bob")
         state, _ = updater.update({"goal": "put apple on table"})
         self.assertEqual(state.dimensions["capability"].uncertainty, 0.5)
         self.assertEqual(
             state.dimensions["reliability"].value["commitment_events"][0]["status"],
             "fulfilled",
         )
+
+    def test_commitment_is_settled_only_by_the_bound_subtask(self):
+        updater, planner = self.make_updater(planner_output())
+        other = dict(TASK, subtask_id="other-apple-task", target_id=21,
+                     target_class="coffeetable")
+        updater.ledger.set_active_tasks([TASK, other])
+        message = updater.ledger.message(
+            0, 1, 0, "I will grab the apple for subtask-apple-table.", "active"
+        )
+        planner.generator.return_value = ([json.dumps(
+            planner_output(message.event_id, [message.event_id])
+        )], 0)
+        updater.update({"goal": "[subtask-apple-table] apple to table"})
+
+        updater.ledger.add(1, "peer_task_progress", {
+            "actor": "Bob", "status": "in_progress", "observed_action": "grab",
+            "task": other,
+        })
+        pending, _ = updater.update({"goal": "two apple tasks"})
+        commitment = pending.dimensions["reliability"].value["commitment_events"][0]
+        self.assertEqual(commitment["subtask_id"], TASK["subtask_id"])
+        self.assertEqual(commitment["status"], "pending")
+
+        updater.ledger.add(2, "peer_task_progress", {
+            "actor": "Bob", "status": "in_progress", "observed_action": "grab",
+            "task": TASK,
+        })
+        fulfilled, _ = updater.update({"goal": "two apple tasks"})
+        commitment = fulfilled.dimensions["reliability"].value["commitment_events"][0]
+        self.assertEqual(commitment["status"], "fulfilled")
+
+    def test_capability_tracks_progress_then_verified_task_success(self):
+        updater, _ = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
+        updater.ledger.observe(0, observation())
+        updater.update({"goal": "put apple on table"})
+        updater.ledger.observe(1, observation([{
+            "from_id": 2, "to_id": 12, "relation_type": "HOLDS_RH",
+        }]))
+
+        progressing, _ = updater.update({"goal": "put apple on table"})
+        capability = progressing.dimensions["capability"].value
+        self.assertIsNone(capability["success_rate"])
+        self.assertEqual(capability["task_execution_events"][0]["status"], "in_progress")
+        self.assertEqual(capability["task_execution_events"][0]["outcome"], "unknown")
+
+        updater.ledger.task_completion(2, TASK, "Bob")
+        completed, _ = updater.update({"goal": "another active task"})
+        capability = completed.dimensions["capability"].value
+        self.assertEqual(capability["success_rate"], 1.0)
+        self.assertEqual(capability["task_execution_events"][0]["status"], "completed")
+        self.assertEqual(capability["task_execution_events"][0]["outcome"], "success")
+
+    def test_alice_completion_does_not_turn_bob_progress_into_failure(self):
+        updater, _ = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
+        updater.ledger.observe(0, observation())
+        updater.ledger.observe(1, observation([{
+            "from_id": 2, "to_id": 12, "relation_type": "HOLDS_RH",
+        }]))
+        updater.ledger.task_completion(2, TASK, "Alice")
+
+        state, _ = updater.update({"goal": "another active task"})
+
+        capability = state.dimensions["capability"].value
+        execution = capability["task_execution_events"][0]
+        self.assertEqual(execution["status"], "abandoned")
+        self.assertEqual(execution["outcome"], "unknown")
+        self.assertEqual(capability["failures"], 0)
+        self.assertIsNone(capability["success_rate"])
 
     def test_policy_context_is_injected_into_existing_planner_prompt(self):
         planner = LLM.__new__(LLM)
