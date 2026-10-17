@@ -33,6 +33,7 @@ class LLM_agent:
 		self.rooms_name = []
 		self.roomname2id = {}
 		self.unsatisfied = {}
+		self.active_goals = []
 		self.steps = 0
 		# self.location = None
 		# self.last_location = None
@@ -66,6 +67,58 @@ class LLM_agent:
 	@property
 	def all_relative_name(self) -> list:
 		return self.containers_name + self.goal_objects_name + self.rooms_name + ['character']
+
+	@staticmethod
+	def _parse_goal(predicate):
+		relation, object_token, target_token = predicate.split('_', 2)
+		target_id = int(target_token.split('(')[-1].split(')')[0]) if '(' in target_token else int(target_token)
+		return relation.lower(), object_token, target_id
+
+	def _node_matches_goal_object(self, node, object_token):
+		return node['id'] == int(object_token) if object_token.isdigit() else node['class_name'] == object_token
+
+	def _refresh_active_goals(self, goal, subtask_records=None):
+		records = {
+			f"{item['relation']}_{item['object_id']}_{item['target_id']}": item
+			for item in (subtask_records or [])
+		}
+		self.active_goals = []
+		for predicate, value in goal.items():
+			count = value[0] if isinstance(value, (list, tuple)) else value
+			if count <= 0:
+				continue
+			relation, object_token, target_id = self._parse_goal(predicate)
+			record = records.get(
+				f"{relation}_{object_token}_{target_id}", {}
+			)
+			self.active_goals.append({
+				'predicate': predicate,
+				'relation': relation,
+				'object_token': object_token,
+				'target_id': target_id,
+				'count': count,
+				'object_class': record.get('object_class'),
+				'target_class': record.get('target_class'),
+			})
+
+	def _put_options(self):
+		options = []
+		for object_id in self.grabbed_objects:
+			obj = self.id2node.get(object_id)
+			if obj is None:
+				continue
+			for goal in self.active_goals:
+				if not self._node_matches_goal_object(obj, goal['object_token']):
+					continue
+				target = self.id2node.get(goal['target_id'])
+				target_class = goal.get('target_class') or (target or {}).get('class_name')
+				if target_class is None:
+					continue
+				options.append(
+					f"[goput] <{obj['class_name']}> ({object_id}) "
+					f"<{target_class}> ({goal['target_id']})"
+				)
+		return list(dict.fromkeys(options))
 	
 	def goexplore(self):
 		target_room_id = int(self.plan.split(' ')[-1][1:-1])
@@ -118,44 +171,57 @@ class LLM_agent:
 			return self.plan.replace('[gograb]', '[walktowards]')
 	
 	def goput(self):
-		# if len(self.progress['goal_location_room']) > 1: # should be ruled out
-		if len(self.grabbed_objects) == 0:
+		ids = [int(value) for value in __import__('re').findall(r'\((\d+)\)', self.plan)]
+		if len(ids) < 2:
+			raise ValueError(f"multi-target goput requires object and target ids: {self.plan}")
+		object_id, target_id = ids[-2], ids[-1]
+		if object_id not in self.grabbed_objects:
 			self.plan = None
 			return None
-		if type(self.id_inside_room[self.goal_location_id]) is list:
-			if len(self.id_inside_room[self.goal_location_id]) == 0:
-				print(f"never find the goal location {self.goal_location}")
-				self.id_inside_room[self.goal_location_id] = self.rooms_name[:]
-			target_room_name = self.id_inside_room[self.goal_location_id][0]
+		goal = next((goal for goal in self.active_goals
+			if goal['target_id'] == target_id
+			and self._node_matches_goal_object(self.id2node[object_id], goal['object_token'])), None)
+		if goal is None:
+			self.plan = None
+			return None
+		target = self.id2node.get(target_id)
+		target_class = goal.get('target_class') or (target or {}).get('class_name') or 'target'
+		target_location = f"<{target_class}> ({target_id})"
+		if type(self.id_inside_room[target_id]) is list:
+			if len(self.id_inside_room[target_id]) == 0:
+				print(f"never find the goal location {target_location}")
+				self.id_inside_room[target_id] = self.rooms_name[:]
+			target_room_name = self.id_inside_room[target_id][0]
 		else:
-			target_room_name = self.id_inside_room[self.goal_location_id]
+			target_room_name = self.id_inside_room[target_id]
 
 		if self.current_room['class_name'] != target_room_name:
 			return f"[walktowards] <{target_room_name}> ({self.roomname2id[target_room_name]})"
-		if self.goal_location not in self.reachable_objects:
-			return f"[walktowards] {self.goal_location}"
-		y = int(self.goal_location.split(' ')[-1][1:-1])
-		y = self.id2node[y]
-		if "CONTAINERS" in y['properties']:
-			if len(self.grabbed_objects) < 2 and'CLOSED' in y['states']:
-				return self.plan.replace('[goput]', '[open]')
-			else:
-				action = '[putin]'
+		if target_location not in self.reachable_objects:
+			return f"[walktowards] {target_location}"
+		y = self.id2node[target_id]
+		if goal['relation'] == 'inside':
+			if 'CLOSED' in y['states']:
+				return f"[open] <{y['class_name']}> ({y['id']})"
+			action = '[putin]'
 		else:
 			action = '[putback]'
-		x = self.id2node[self.grabbed_objects[0]]
+		x = self.id2node[object_id]
 		return f"{action} <{x['class_name']}> ({x['id']}) <{y['class_name']}> ({y['id']})"
 
 
 	def LLM_plan(self, location):
-		if len(self.grabbed_objects) == 2:
-			return f"[goput] {self.goal_location}", {}
-
 		context = ""
 		if self.trace is not None:
 			self.trace.update()
 			context = render_policy_context(self.trace.state, self.trace.ledger)
-		return self.LLM.run(location, self.current_room, [self.id2node[x] for x in self.grabbed_objects], self.satisfied, self.unchecked_containers, self.ungrabbed_objects, self.id_inside_room[self.goal_location_id], self.action_history, self.dialogue_history, self.opponent_grabbed_objects, self.id_inside_room[self.opponent_agent_id], None, self.steps, belief_context=context)
+		return self.LLM.run(
+			location, self.current_room, [self.id2node[x] for x in self.grabbed_objects],
+			self.satisfied, self.unchecked_containers, self.ungrabbed_objects, None,
+			self.action_history, self.dialogue_history, self.opponent_grabbed_objects,
+			self.id_inside_room[self.opponent_agent_id], None, self.steps,
+			belief_context=context, put_options=self._put_options(),
+		)
 
 
 	def check_progress(self, state, goal_spec):
@@ -164,12 +230,14 @@ class LLM_agent:
 		id2node = {node['id']: node for node in state['nodes']}
 
 		for key, value in goal_spec.items():
-			elements = key.split('_')
+			relation, object_token, target_id = self._parse_goal(key)
 			cnt = value[0]
 			for edge in state['edges']:
 				if cnt == 0:
 					break
-				if edge['relation_type'].lower() == elements[0] and edge['to_id'] == self.goal_location_id and id2node[edge['from_id']]['class_name'] == elements[1]:
+				if (edge['relation_type'].lower() == relation
+						and edge['to_id'] == target_id
+						and self._node_matches_goal_object(id2node[edge['from_id']], object_token)):
 					satisfied.append(id2node[edge['from_id']])
 					cnt -= 1
 					# if self.debug:
@@ -205,10 +273,8 @@ class LLM_agent:
 			self.trace.ledger.observe(self.steps, observation)
 
 		satisfied, unsatisfied = self.check_progress(observation, goal)
-		# print(f"satisfied: {satisfied}")
-		if len(satisfied) > 0:
-			self.unsatisfied = unsatisfied
-			self.satisfied = satisfied
+		self.unsatisfied = unsatisfied
+		self.satisfied = satisfied
 		obs = self.filter_graph(observation)
 		self.grabbed_objects = []
 		opponent_grabbed_objects = []
@@ -241,15 +307,22 @@ class LLM_agent:
 						ungrabbed.pop(j)
 				continue
 			self.id_inside_room[x['id']] = self.current_room['class_name']
-			if x['class_name'] in self.containers_name and 'CLOSED' in x['states'] and x['id'] != self.goal_location_id:
+			target_ids = {goal['target_id'] for goal in self.active_goals}
+			if x['class_name'] in self.containers_name and 'CLOSED' in x['states'] and x['id'] not in target_ids:
 				unchecked_containers.append(x)
-			if any([x['class_name'] == g.split('_')[1] for g in self.unsatisfied]) and all([x['id'] != y['id'] for y in self.satisfied]) and 'GRABBABLE' in x['properties'] and x['id'] not in self.grabbed_objects and x['id'] not in [w['id'] for w in opponent_grabbed_objects]:
+			if (any(self._node_matches_goal_object(x, self._parse_goal(g)[1]) for g in self.unsatisfied)
+					and all([x['id'] != y['id'] for y in self.satisfied])
+					and 'GRABBABLE' in x['properties']
+					and x['id'] not in self.grabbed_objects
+					and x['id'] not in [w['id'] for w in opponent_grabbed_objects]):
 				ungrabbed_objects.append(x)
 
-		if type(self.id_inside_room[self.goal_location_id]) is list and self.current_room['class_name'] in self.id_inside_room[self.goal_location_id]:
-			self.id_inside_room[self.goal_location_id].remove(self.current_room['class_name'])
-			if len(self.id_inside_room[self.goal_location_id]) == 1:
-				self.id_inside_room[self.goal_location_id] = self.id_inside_room[self.goal_location_id][0]
+		for target_id in target_ids:
+			self.id_inside_room.setdefault(target_id, self.rooms_name[:])
+			if type(self.id_inside_room[target_id]) is list and self.current_room['class_name'] in self.id_inside_room[target_id]:
+				self.id_inside_room[target_id].remove(self.current_room['class_name'])
+				if len(self.id_inside_room[target_id]) == 1:
+					self.id_inside_room[target_id] = self.id_inside_room[target_id][0]
 		self.unchecked_containers[self.current_room['class_name']] = unchecked_containers[:]
 		self.ungrabbed_objects[self.current_room['class_name']] = ungrabbed_objects[:]
 
@@ -317,14 +390,17 @@ class LLM_agent:
 		if self.stuck > 20:
 			print("Warning! stuck!")
 			self.action_history[-1] += ' but unfinished'
+			stuck_plan = self.plan
 			self.plan = None
-			if type(self.id_inside_room[self.goal_location_id]) is list:
-				target_room_name = self.id_inside_room[self.goal_location_id][0]
-			else:
-				target_room_name = self.id_inside_room[self.goal_location_id]
-			action = f"[walktowards] {self.goal_location}"
-			if self.current_room['class_name'] != target_room_name:
-				action = f"[walktowards] <{target_room_name}> ({self.roomname2id[target_room_name]})"
+			if stuck_plan and stuck_plan.startswith('[goput]'):
+				target_id = [int(value) for value in __import__('re').findall(r'\((\d+)\)', stuck_plan)][-1]
+				target = self.id2node[target_id]
+				target_location = f"<{target['class_name']}> ({target_id})"
+				target_room = self.id_inside_room[target_id]
+				target_room_name = target_room[0] if type(target_room) is list else target_room
+				action = f"[walktowards] {target_location}"
+				if self.current_room['class_name'] != target_room_name:
+					action = f"[walktowards] <{target_room_name}> ({self.roomname2id[target_room_name]})"
 			self.stuck = 0
 	
 		if self.trace is not None:
@@ -340,6 +416,38 @@ class LLM_agent:
 	def observe_trace_outcome(self, observation, step):
 		if self.trace is not None:
 			self.trace.ledger.observe(step, observation)
+
+	def update_task_goal(self, goal, subtask_records=None):
+		"""Refresh a dynamic public goal without touching plans, history, or TRACE."""
+		active = {key: value for key, value in goal.items() if value[0] > 0}
+		if not active:
+			self.active_goals = []
+			self.unsatisfied = {}
+			return
+		self._refresh_active_goals(active, subtask_records)
+		first = self.active_goals[0]
+		known_nodes = getattr(self, 'id2node', {})
+		first_target = known_nodes.get(first['target_id'])
+		first_target_class = first.get('target_class') or (first_target or {}).get('class_name') or 'target'
+		self.goal_location = f"<{first_target_class}> ({first['target_id']})"
+		self.goal_location_id = first['target_id']
+		for item in self.active_goals:
+			self.id_inside_room.setdefault(item['target_id'], self.rooms_name[:])
+			if item.get('object_class'):
+				self.goal_objects_name.append(item['object_class'])
+			elif item['object_token'].isdigit():
+				node = known_nodes.get(int(item['object_token']))
+				if node is not None:
+					self.goal_objects_name.append(node['class_name'])
+			else:
+				self.goal_objects_name.append(item['object_token'])
+			target = known_nodes.get(item['target_id'])
+			target_class = item.get('target_class') or (target or {}).get('class_name')
+			if target_class:
+				self.goal_objects_name.append(target_class)
+		self.goal_objects_name = list(dict.fromkeys(self.goal_objects_name))
+		self.unsatisfied = {key: value[0] for key, value in active.items()}
+		self.LLM.refresh_goal(self.goal_location, self.unsatisfied, subtask_records)
 
 	def reply_to_message(self, message, observation):
 		room = self.current_room['class_name'] if self.current_room else None
@@ -386,10 +494,13 @@ class LLM_agent:
 		self.stuck = 0
 		self.last_room = None
 		self.unsatisfied = {k: v[0] for k, v in goal.items()}
+		self._refresh_active_goals(goal)
 		self.satisfied = []
 		self.goal_location = list(goal.keys())[0].split('_')[-1]
 		self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
-		self.id_inside_room = {self.goal_location_id: self.rooms_name[:], self.opponent_agent_id: None}
+		self.id_inside_room = {self.opponent_agent_id: None}
+		for item in self.active_goals:
+			self.id_inside_room[item['target_id']] = self.rooms_name[:]
 		self.unchecked_containers = {
 			"livingroom": None,
 			"kitchen": None,

@@ -17,11 +17,23 @@ from run_experiment import validate  # noqa: E402
 
 from LLM.LLM import LLM  # noqa: E402
 from agents.LLM_agent import LLM_agent  # noqa: E402
+from envs.unity_environment import UnityEnvironment  # noqa: E402
 from trace_tf.events import EvidenceLedger  # noqa: E402
 from trace_tf.model import BeliefState  # noqa: E402
 
 
 class ExperimentRunnerTests(unittest.TestCase):
+    def test_exact_object_id_is_not_corrupted_by_target_decoration(self):
+        env = UnityEnvironment.__new__(UnityEnvironment)
+        env.id2node = {72: {"id": 72, "class_name": "kitchentable"}}
+        env.goal_class = {}
+
+        goal = env.get_goal({"on_372_72": 1}, "LLM")
+
+        self.assertEqual(goal, {
+            "on_372_<kitchentable> (72)": [1, True, 2]
+        })
+
     def test_wah_episode_and_profile_are_independent(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -136,6 +148,57 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertTrue(call["trace_updated"])
         self.assertEqual(call["trace_new_event_ids"], ["e00000"])
         self.assertEqual(agent.plan, "[gograb] <apple> (12)")
+
+    def test_continuous_goal_refresh_does_not_reset_plan_history_or_trace(self):
+        trace = object()
+        agent = LLM_agent.__new__(LLM_agent)
+        agent.goal_location = "<kitchentable> (72)"
+        agent.goal_location_id = 72
+        agent.id_inside_room = {72: "kitchen"}
+        agent.rooms_name = ["kitchen", "livingroom"]
+        agent.goal_objects_name = ["apple", "kitchentable"]
+        agent.unsatisfied = {"on_apple_<kitchentable> (72)": 1}
+        agent.plan = "[gograb] <apple> (10)"
+        agent.action_history = [agent.plan]
+        agent.dialogue_history = ["Bob: I found the apple."]
+        agent.trace = trace
+        agent.LLM = SimpleNamespace(refresh_goal=Mock())
+
+        agent.update_task_goal({
+            "on_pudding_<kitchentable> (72)": [1, True, 2],
+            "on_juice_<kitchentable> (72)": [1, True, 2],
+        })
+
+        self.assertEqual(agent.plan, "[gograb] <apple> (10)")
+        self.assertEqual(agent.action_history, [agent.plan])
+        self.assertEqual(agent.dialogue_history, ["Bob: I found the apple."])
+        self.assertIs(agent.trace, trace)
+        self.assertIn("pudding", agent.goal_objects_name)
+        agent.LLM.refresh_goal.assert_called_once()
+
+    def test_continuous_exact_inside_goal_produces_putin(self):
+        agent = LLM_agent.__new__(LLM_agent)
+        agent.rooms_name = ["kitchen", "livingroom"]
+        agent.roomname2id = {"kitchen": 11, "livingroom": 267}
+        agent.current_room = {"id": 11, "class_name": "kitchen"}
+        agent.grabbed_objects = [10]
+        agent.id2node = {
+            10: {"id": 10, "class_name": "apple", "properties": ["GRABBABLE"], "states": []},
+            103: {"id": 103, "class_name": "fridge", "properties": ["CONTAINERS"], "states": ["OPEN"]},
+        }
+        agent.id_inside_room = {103: "kitchen"}
+        agent.reachable_objects = ["<fridge> (103)"]
+        agent.active_goals = [{
+            "predicate": "inside_10_103", "relation": "inside",
+            "object_token": "10", "target_id": 103, "count": 1,
+            "object_class": "apple", "target_class": "fridge",
+        }]
+        agent.plan = "[goput] <apple> (10) <fridge> (103)"
+
+        self.assertEqual(agent._put_options(), [agent.plan])
+        self.assertEqual(
+            agent.goput(), "[putin] <apple> (10) <fridge> (103)"
+        )
 
     def test_port_lock_blocks_another_local_runner(self):
         with tempfile.TemporaryDirectory() as temporary:

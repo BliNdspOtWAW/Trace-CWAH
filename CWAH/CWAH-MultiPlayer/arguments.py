@@ -137,6 +137,14 @@ def get_args():
                         help='planner prompt for Agent 2; defaults to prompt_Peer.txt')
     parser.add_argument('--trace-mode', choices=['off', 'on'], default='off',
                         help='enable TRACE belief updates and planner injection for Agent 1')
+    parser.add_argument('--continuous-subtasks', action='store_true', default=False,
+                        help='replenish completed native WAH goal predicates until the step budget')
+    parser.add_argument('--continuous-active-count', type=int, default=3,
+                        help='number of active predicates maintained in continuous mode')
+    parser.add_argument('--continuous-seed', type=int, default=1,
+                        help='deterministic subtask candidate-selection seed')
+    parser.add_argument('--continuous-config-json', type=str, default=None,
+                        help='JSON object with state-based targets and generation limits')
     parser.add_argument('--api_base', type=str, default=None, 
                         help='LLM key')
     parser.add_argument('--api_key', type=str, default="EMPTY",

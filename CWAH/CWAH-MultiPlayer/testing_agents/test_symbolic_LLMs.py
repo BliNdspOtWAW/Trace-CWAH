@@ -56,6 +56,7 @@ if __name__ == '__main__':
 
 
     def env_fn(env_id):
+        continuous_config = json.loads(args.continuous_config_json) if args.continuous_config_json else {}
         return UnityEnvironment(num_agents=2,
                                max_episode_length=args.max_episode_length,
                                port_id=env_id,
@@ -64,7 +65,13 @@ if __name__ == '__main__':
                                observation_types=[args.obs_type, args.obs_type],
                                use_editor=args.use_editor,
                                executable_args=executable_args,
-                               base_port=args.base_port)
+                               base_port=args.base_port,
+                               continuous_subtasks={
+                                   "enabled": args.continuous_subtasks,
+                                   "active_count": args.continuous_active_count,
+                                   "seed": args.continuous_seed,
+                                   **continuous_config,
+                               })
 
     args_agent1 = {
         'agent_id': 1,

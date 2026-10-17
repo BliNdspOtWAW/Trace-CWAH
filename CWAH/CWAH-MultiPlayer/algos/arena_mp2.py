@@ -63,6 +63,11 @@ class ArenaMP(object):
                 agent.reset(ob[it], self.env.all_containers_name, self.env.all_goal_objects_name, self.env.all_room_name, self.env.room_info, self.env.goal_spec[it], task)
             else:
                 agent.reset(self.env.full_graph)
+        if getattr(self.env, 'continuous_subtasks_enabled', False):
+            records = self.env.continuous_subtasks.active_subtasks()
+            for it, agent in enumerate(self.agents):
+                if 'LLM' in agent.agent_type:
+                    agent.update_task_goal(self.env.goal_spec[it], records)
 
     def set_weigths(self, epsilon, weights):
         for agent in self.agents:
@@ -84,7 +89,9 @@ class ArenaMP(object):
         op_subgoal = {0: None, 1: None}
         # pdb.set_trace()
         for it, agent in enumerate(self.agents):
-            if self.task_goal is None:
+            if getattr(self.env, 'continuous_subtasks_enabled', False):
+                goal_spec = self.env.get_goal(self.env.task_goal[it], self.env.agent_goals[it])
+            elif self.task_goal is None:
                 goal_spec = self.env.get_goal(self.env.task_goal[it], self.env.agent_goals[it])
 
             else:
@@ -111,6 +118,10 @@ class ArenaMP(object):
                     dict_actions[it], dict_info[it] = agent.get_action(obs[it], self.task_goal, action_space_ids=action_space[it])
 
             elif 'LLM' in agent.agent_type:
+                if getattr(self.env, 'continuous_subtasks_enabled', False):
+                    agent.update_task_goal(
+                        goal_spec, self.env.continuous_subtasks.active_subtasks()
+                    )
                 dict_actions[it], dict_info[it] = agent.get_action(obs[it], goal_spec)
 
         return dict_actions, dict_info
@@ -482,6 +493,8 @@ class ArenaMP(object):
                       'communication_token_usage': {
                           'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0
                       },
+                      'continuous_subtask_events': [],
+                      'termination_reason': None,
                       
                     }
         success = False
@@ -497,6 +510,10 @@ class ArenaMP(object):
                     for key in saved_info['communication_token_usage']:
                         saved_info['communication_token_usage'][key] += usage.get(key) or 0
             success = infos['finished']
+            if 'continuous_subtasks' in infos:
+                saved_info['continuous_subtask_events'].append(copy.deepcopy(infos['continuous_subtasks']))
+            if infos.get('termination_reason') is not None:
+                saved_info['termination_reason'] = infos['termination_reason']
             # if infos['failed_exec']:
             #     raise ValueError(infos)
             if 'satisfied_goals' in infos:
@@ -549,6 +566,14 @@ class ArenaMP(object):
             if done:
                 break
         saved_info['finished'] = success
+        if getattr(self.env, 'continuous_subtasks_enabled', False):
+            saved_info['continuous_subtasks'] = self.env.continuous_subtasks_summary()
+            saved_info['continuous_subtasks']['environment_steps'] = self.env.steps
+            saved_info['continuous_subtasks']['termination_reason'] = saved_info['termination_reason']
+            saved_info['continuous_subtasks']['completed_per_100_steps'] = (
+                100.0 * saved_info['continuous_subtasks']['completed_subtasks'] / self.env.steps
+                if self.env.steps else 0.0
+            )
         if self.agents and getattr(self.agents[0], "trace", None) is not None:
             trace = self.agents[0].trace
             updater_calls = [entry['llm_call'] for entry in trace.update_log if entry['llm_call']]

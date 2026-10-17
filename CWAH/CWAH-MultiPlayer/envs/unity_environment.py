@@ -13,6 +13,7 @@ import copy
 import ipdb
 from functools import partial
 import re
+from envs.continuous_subtasks import ContinuousSubtaskManager
 
 
 class UnityEnvironment(BaseUnityEnvironment):
@@ -36,7 +37,8 @@ class UnityEnvironment(BaseUnityEnvironment):
 				 data_collection_dir = None,
 				 save_image = False,
 				 gt_seg = True,
-				 seed=123):
+				 seed=123,
+				 continuous_subtasks=None):
 
 		if agent_goals is not None:
 			self.agent_goals = agent_goals
@@ -45,6 +47,8 @@ class UnityEnvironment(BaseUnityEnvironment):
 
 		self.task_goal, self.goal_spec = {0: {}, 1: {}}, {0: {}, 1: {}}
 		self.env_task_set = env_task_set
+		self.continuous_subtasks_config = continuous_subtasks or {"enabled": False}
+		self.continuous_subtasks = None
 		super(UnityEnvironment, self).__init__(
 			num_agents=num_agents,
 			max_episode_length=max_episode_length,
@@ -85,6 +89,21 @@ class UnityEnvironment(BaseUnityEnvironment):
 		self.detection_name_id_map = {name:  (i + 1) * 10 for i, name in enumerate(self.detection_all_object)}
 		self.location = None
 		self.keep_move_steps = None
+
+	@property
+	def continuous_subtasks_enabled(self):
+		return self.continuous_subtasks is not None
+
+	def _sync_continuous_goal(self):
+		goal = self.continuous_subtasks.task_goal()
+		self.task_goal = {agent_id: copy.deepcopy(goal) for agent_id in range(self.num_agents)}
+		self.goal_spec = {
+			agent_id: self.get_goal(self.task_goal[agent_id], self.agent_goals[agent_id])
+			for agent_id in range(self.num_agents)
+		}
+
+	def continuous_subtasks_summary(self):
+		return self.continuous_subtasks.summary() if self.continuous_subtasks else None
  
 	def reward(self):
 		reward = 0.
@@ -169,17 +188,28 @@ class UnityEnvironment(BaseUnityEnvironment):
 			'''
 			Hongxin changed task_goal from "on_cupcake_268" to "on_cupcake_<coffeetable> (268)"
 			'''
-			goal_class = {}
-			for predicate in self.goal_class.keys():
-				rel, obj1, obj2 = predicate.split('_')
-				goal_class[f"{rel}_{obj1}"] = obj2
 			new_task_goal = {}
 			for predicate, count in task_spec.items():
 				if count == 0:
 					continue
 				rel, obj1, obj2 = predicate.split('_')
-				obj2_name = goal_class[f"{rel}_{obj1}"]
-				new_predicate = predicate.replace(obj2, f"<{obj2_name}> ({obj2})")
+				target = (getattr(self, 'id2node', None) or {}).get(int(obj2))
+				if target is not None:
+					obj2_name = target['class_name']
+				else:
+					# During the first reset the Unity graph is not loaded yet, so
+					# retain the dataset's native target-class lookup as a fallback.
+					matching = [
+						value for key, value in self.goal_class.items()
+						if key.split('_')[0] == rel and key.split('_')[1] == obj1
+					]
+					if not matching:
+						raise ValueError("goal target {} is absent from the current scene".format(obj2))
+					obj2_name = matching[0]
+				# Rebuild the predicate from parsed fields. ``str.replace`` corrupts
+				# concrete object IDs that contain the target ID (for example,
+				# ``on_372_72`` previously became ``on_3<table>...``).
+				new_predicate = f"{rel}_{obj1}_<{obj2_name}> ({obj2})"
 				new_task_goal[new_predicate] = count
 			# print(new_task_goal)
 			res_dict = {goal_k: [goal_c, True, 2] for goal_k, goal_c in new_task_goal.items()}
@@ -377,6 +407,19 @@ class UnityEnvironment(BaseUnityEnvironment):
 		self.full_graph = curr_graph
 		self.id_to_name = {node['id']: node['class_name'] for node in curr_graph['nodes']}
 		self.message_said = [None for _ in range(self.num_agents)]
+		self.continuous_subtasks = None
+		if self.continuous_subtasks_config.get("enabled", False):
+			self.continuous_subtasks = ContinuousSubtaskManager(
+				self.task_goal[0],
+				active_count=self.continuous_subtasks_config.get("active_count", 3),
+				seed=self.continuous_subtasks_config.get("seed", 1),
+				targets=self.continuous_subtasks_config.get("targets"),
+				max_generation_attempts=self.continuous_subtasks_config.get("max_generation_attempts", 64),
+				reverse_cooldown_steps=self.continuous_subtasks_config.get("reverse_cooldown_steps", 20),
+			)
+			initial_event = self.continuous_subtasks.initialize(curr_graph, step=0)
+			self._sync_continuous_goal()
+			print("continuous_subtasks: {}".format(initial_event))
 
 		self.location = [[] for _ in range(self.num_agents)]
 		self.last_script = [None for _ in range(self.num_agents)]
@@ -465,24 +508,35 @@ class UnityEnvironment(BaseUnityEnvironment):
 					else:
 						self.changed_graph = True
 
-		# Obtain reward
-		reward, done, info = self.reward()
-
 		graph = self.get_graph()
 		self.steps += 1
+		if self.continuous_subtasks_enabled:
+			continuous_event = self.continuous_subtasks.advance(graph, self.steps)
+			self._sync_continuous_goal()
+			reward = float(self.continuous_subtasks.completed_count)
+			done = False
+			satisfied, _ = utils.check_progress(graph, self.goal_spec[0])
+			info = {
+				"satisfied_goals": satisfied,
+				"continuous_subtasks": continuous_event,
+			}
+		else:
+			# Preserve the original static-task reward and termination semantics.
+			reward, done, info = self.reward()
 
 #		obs = self.get_observations()
 		obs = None
 		# already get it in env.get_observations()
 
-		info['finished'] = done
 		info['graph'] = graph
 		info['failed_exec'] = failed_execution
-		satisfied, unsatisfied = utils.check_progress(self.get_graph(), self.goal_spec[0])
+		satisfied, unsatisfied = utils.check_progress(graph, self.goal_spec[0])
 		info['progress'] = {'satisfied': satisfied, 'unsatisfied': unsatisfied}
 		
-		if self.steps == self.max_episode_length:
+		if self.steps >= self.max_episode_length:
 			done = True
+			info['termination_reason'] = 'step_budget'
+		info['finished'] = done
 		messages = saying
 		self.message_said = saying		
 

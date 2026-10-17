@@ -53,6 +53,7 @@ class LLM:
         self.oppo_pronoun = "she" if agent_id == 2 else "he"
         self.debug = sampling_parameters.debug
         self.goal_location = None
+        self.active_subtasks = []
         self.goal_location_id = None
         self.roomname2id = {}
         self.rooms = []
@@ -219,6 +220,7 @@ class LLM:
         self.obs = obs
         self.roomname2id = roomname2id
         self.goal_location = goal_location
+        self.active_subtasks = []
         self.task = task
         if self.teammate_profile_file is not None:
             if self.agent_id == 2:
@@ -240,16 +242,26 @@ class LLM:
                 
         else:
             self.personality = ""
+        self.id2node = {x['id']: x for x in obs['nodes']}
         self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
         self.goal_desc, self.goal_location_with_r = self.goal2description(unsatisfied, None)
-        self.id2node = {x['id']: x for x in obs['nodes']}
+
+    def refresh_goal(self, goal_location, unsatisfied, active_subtasks=None):
+        """Refresh public task text without resetting personality or histories."""
+        self.goal_location = goal_location
+        self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
+        self.active_subtasks = list(active_subtasks or [])
+        self.goal_desc, self.goal_location_with_r = self.goal2description(unsatisfied, None)
 
     def goal2description(self, goals, goal_location_room):
         map_rel_to_pred = {'inside': 'into', 'on': 'onto'}
-        s = "Find and put "
-        r = None
+        records = {
+            f"{item['relation']}_{item['object_id']}_{item['target_id']}": item
+            for item in self.active_subtasks
+        }
+        descriptions = []
         for predicate, vl in goals.items():
-            relation, obj1, obj2 = predicate.split('_')
+            relation, obj1, obj2 = predicate.split('_', 2)
             count = vl
             if count == 0:
                 continue
@@ -258,12 +270,25 @@ class LLM:
             elif relation == 'sit':
                 continue
             else:
-                s += f"{count} {obj1}{'s' if count > 1 else ''}, "
-                r = relation
-        if r is None:
-            return "None."
-        s = s[:-2] + f" {map_rel_to_pred[r]} the {self.goal_location}."
-        return s, f"{map_rel_to_pred[r]} the {self.goal_location}"
+                target_id = int(obj2.split('(')[-1].split(')')[0]) if '(' in obj2 else int(obj2)
+                record = records.get(f"{relation}_{obj1}_{target_id}", {})
+                target_class = record.get('target_class')
+                if not target_class and '<' in obj2:
+                    target_class = obj2.split('<', 1)[1].split('>', 1)[0]
+                target = self.id2node.get(target_id, {"class_name": target_class or "target"})
+                if obj1.isdigit():
+                    object_id = int(obj1)
+                    obj = self.id2node.get(object_id, {"class_name": record.get('object_class') or "object"})
+                    object_text = f"<{obj['class_name']}> ({object_id})"
+                else:
+                    object_text = f"{count} {obj1}{'s' if count > 1 else ''}"
+                descriptions.append(
+                    f"put {object_text} {map_rel_to_pred[relation]} "
+                    f"<{target['class_name']}> ({target_id})"
+                )
+        if not descriptions:
+            return "None.", "at their assigned destinations"
+        return "Complete these shared subtasks: " + "; ".join(descriptions) + ".", "at their assigned destinations"
 
     def parse_answer(self, available_actions, text):
         import re
@@ -470,7 +495,8 @@ class LLM:
                 s += f"I found {sss[room]} in the {room}. "
         return s
 
-    def get_available_plans(self, location, grabbed_objects, unchecked_containers, ungrabbed_objects, message, room_explored):
+    def get_available_plans(self, location, grabbed_objects, unchecked_containers,
+                            ungrabbed_objects, message, room_explored, put_options=None):
         def get_distance_xy(pos1, pos2):
             import math
             dx = pos1[0] - pos2[0]
@@ -508,8 +534,8 @@ class LLM:
                         available_plans.append(f"[gograb] <{obj['class_name']}> ({obj['id']}) - distance: {dist:.4f}")
                     else:
                         available_plans.append(f"[gograb] <{obj['class_name']}> ({obj['id']})")
-        if len(grabbed_objects) > 0:
-            available_plans.append(f"[goput] {self.goal_location}")
+        for option in put_options or []:
+            available_plans.append(option)
         plans = ""
         plans_refine = ""
         available_plans.append(f"[send_message]")
@@ -532,7 +558,10 @@ class LLM:
         
         return plans, plans_refine, available_plans, available_plans_refine, len(available_plans)
 
-    def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers, ungrabbed_objects, goal_location_room, action_history, dialogue_history, opponent_grabbed_objects, opponent_last_room, room_explored=None, steps=0, belief_context=""):
+    def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers,
+            ungrabbed_objects, goal_location_room, action_history, dialogue_history,
+            opponent_grabbed_objects, opponent_last_room, room_explored=None, steps=0,
+            belief_context="", put_options=None):
         info = {}
         progress_desc = self.progress2text(current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored)
         action_history_desc = ", ".join(action_history[-10:] if len(action_history) > 10 else action_history)
@@ -544,7 +573,10 @@ class LLM:
         prompt = prompt.replace('$ASSIGNED_PERSONALITY', self.personality or 'None')
         prompt = prompt.replace('$DIALOGUE_HISTORY', dialogue_history_desc)
         prompt = prompt.replace('$TRACE_BELIEF', belief_context)
-        available_plans, available_plans_refine, available_plans_list, available_plans_list_refine, num = self.get_available_plans(location, grabbed_objects, unchecked_containers, ungrabbed_objects, None, room_explored)
+        available_plans, available_plans_refine, available_plans_list, available_plans_list_refine, num = self.get_available_plans(
+            location, grabbed_objects, unchecked_containers, ungrabbed_objects,
+            None, room_explored, put_options=put_options
+        )
         if num == 0:
             print("Warning! No available plans!")
             plan = None

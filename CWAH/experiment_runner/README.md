@@ -17,6 +17,7 @@ cp CWAH/experiment_runner/config.example.json CWAH/experiment_runner/config.loca
 - `dataset.episode_index`：**列表索引**，例如 `44`，不是 CollabBench 论文 Task ID。
 - `bob_profile`：`id` 仅用于结果目录标签；`text_file` 才是 Bob 实际收到的画像内容。两者不参与任务选择。无画像时填 `null`。
 - `trace_mode`：`off` 完全不创建 TRACE Updater、不向 Alice Planner 注入 Belief；`on` 才启用。Bob 始终不读 Alice 的 TRACE Belief。
+- `continuous_subtasks`：可选的动态 Subtask 配置。`enabled=true` 时，环境保持指定数量的物体级 Subtask；完成一个后，根据当前场景随机选择可搬运物体和白名单目标，经“未满足、未被持有或占用、不与活跃任务冲突、容量和反向搬运冷却”校验后补充。失败会重新采样，并在后续环境步继续尝试。`seed` 使采样序列可复现。该机制不创建委派、不写入 TRACE Evidence，也不额外触发 TRACE Updater。
 - `alice_prompt_file`、`bob_prompt_file`：可选的 Planner Prompt 文件路径；默认两人都用 `LLM/prompt_Peer.txt`。路径相对于 TRACE 根目录，结果 `config.json` 会记录实际路径和 SHA-256。TRACE `on` 时 Alice 的 Prompt 必须包含 `$TRACE_BELIEF`。
 - `experiment_label`：可选的结果目录标签，仅接受字母、数字、`_`、`-`。
 - `alice_model`、`bob_model`：两人的实际 API 模型 ID，可以分别设置。
@@ -86,6 +87,24 @@ python CWAH/experiment_runner/run_experiment.py --config CWAH/experiment_runner/
 不同 Bash 各自需要激活 `CWAH` 环境并加载 API 变量。单实验入口同样自动分配端口，并使用跨进程锁；即使两个 Bash 同时启动，也不会领取同一个端口。顺序运行可复用端口。多个 Unity/LLM 请求会占用更多内存与 API 配额，建议先用两个实验试运行。
 
 对照实验应在相同 Episode、Bob 画像、两个模型、采样参数与 Unity 版本下分别运行 `trace_mode=off` 和 `on`。这里的 off 是**当前统一 Peer/Reply Prompt 下的对照**，不是旧版 CoELA Prompt。当前工作树如果有未提交修改，单靠 Commit SHA 不能完全恢复实验代码；正式实验前请保存补丁或提交版本。
+
+## Continuous C-WAH
+
+`configs/continuous/` 提供 Episode 44、Peer17、TRACE off/on 的成对配置。初始任务仍是 Episode 44 的三个 `prepare_food` 目标；之后从当前场景状态随机生成具体物体实例到合法目标位置的新 Subtask。示例目标包括 Kitchen Table、Coffee Table、Desk 和 Fridge，且同时活跃的 Subtask 不会争用同一物体。Unity、物体位置、Agent 执行状态、Dialogue History 和 TRACE Belief 均不重置。
+
+Subtask 更新是公共任务状态变化，不是队友证据。Agent 在下一次正常高层规划时读取最新 Goal；不会仅因补充 Subtask 立即重规划或调用 TRACE。随机生成在单次补充达到 `max_generation_attempts` 后暂时保留已有活跃任务，并在下一环境步重试；不会因候选暂时生成失败提前结束。Continuous 运行仅以 Step Budget 结束。结果轨迹中的 `continuous_subtasks` 和 `continuous_subtask_events` 记录具体物体、目标、累计完成数、采样次数及拒绝原因，`summary.json` 会复制最终汇总。
+
+运行命令：
+
+```bash
+python CWAH/experiment_runner/run_many.py \
+  --config-dir CWAH/experiment_runner/configs/continuous \
+  --check
+
+python CWAH/experiment_runner/run_many.py \
+  --config-dir CWAH/experiment_runner/configs/continuous \
+  --max-parallel 2
+```
 
 ## Active 与 Reactive Planner
 

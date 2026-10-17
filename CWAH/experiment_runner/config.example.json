@@ -8,6 +8,20 @@
     "text_file": "CWAH/experiment_runner/profiles/peer17.txt"
   },
   "trace_mode": "off",
+  "continuous_subtasks": {
+    "enabled": false,
+    "active_count": 3,
+    "seed": 1,
+    "generation_mode": "state_based",
+    "max_generation_attempts": 64,
+    "reverse_cooldown_steps": 20,
+    "targets": [
+      {"relation": "on", "object_id": 72, "object_class": "kitchentable", "capacity": 6},
+      {"relation": "on", "object_id": 268, "object_class": "coffeetable", "capacity": 5},
+      {"relation": "on", "object_id": 213, "object_class": "desk", "capacity": 5},
+      {"relation": "inside", "object_id": 103, "object_class": "fridge", "capacity": 6}
+    ]
+  },
   "alice_model": "deepseek-ai/DeepSeek-V3.1",
   "bob_model": "deepseek-ai/DeepSeek-V3.1",
   "temperature": 0,

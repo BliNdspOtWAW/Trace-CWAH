@@ -45,9 +45,12 @@ def main(argv=None):
     jobs = preflight(config_dir)
     for path, config, selected in jobs:
         episode = selected["episode"]
+        continuous = selected.get("continuous_subtasks", {"enabled": False})
         print(f"{path.name}: episode={selected['episode_index']} "
               f"({episode['task_id']}_{episode['task_name']}), profile={selected['profile_id']}, "
-              f"TRACE={selected['trace_mode']}, port={selected['port_request']}", flush=True)
+              f"TRACE={selected['trace_mode']}, "
+              f"continuous={continuous['enabled']}, "
+              f"port={selected['port_request']}", flush=True)
     if args.check:
         print(f"Validated {len(jobs)} configs. No Unity or LLM started.")
         return 0

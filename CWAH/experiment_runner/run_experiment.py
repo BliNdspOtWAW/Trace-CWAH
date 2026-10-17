@@ -72,6 +72,63 @@ def validate(config):
     mode = config["trace_mode"]
     if mode not in ("off", "on"):
         raise ValueError("trace_mode must be off or on")
+    continuous = config.get("continuous_subtasks", {"enabled": False})
+    if not isinstance(continuous, dict) or type(continuous.get("enabled", False)) is not bool:
+        raise ValueError("continuous_subtasks must be an object with a boolean enabled field")
+    continuous = {
+        "enabled": continuous.get("enabled", False),
+        "active_count": continuous.get("active_count", 3),
+        "seed": continuous.get("seed", 1),
+        "generation_mode": continuous.get("generation_mode", "state_based"),
+        "max_generation_attempts": continuous.get("max_generation_attempts", 64),
+        "reverse_cooldown_steps": continuous.get("reverse_cooldown_steps", 20),
+        "targets": continuous.get("targets", []),
+    }
+    if type(continuous["active_count"]) is not int or continuous["active_count"] < 1:
+        raise ValueError("continuous_subtasks.active_count must be a positive integer")
+    if type(continuous["seed"]) is not int:
+        raise ValueError("continuous_subtasks.seed must be an integer")
+    if continuous["generation_mode"] != "state_based":
+        raise ValueError("continuous_subtasks.generation_mode must be state_based")
+    if type(continuous["max_generation_attempts"]) is not int or continuous["max_generation_attempts"] < 1:
+        raise ValueError("continuous_subtasks.max_generation_attempts must be a positive integer")
+    if type(continuous["reverse_cooldown_steps"]) is not int or continuous["reverse_cooldown_steps"] < 0:
+        raise ValueError("continuous_subtasks.reverse_cooldown_steps must be a nonnegative integer")
+    if continuous["enabled"]:
+        initial_goal = episode["task_goal"].get(0, {})
+        active_predicates = sum(value > 0 for value in initial_goal.values())
+        if active_predicates > continuous["active_count"]:
+            raise ValueError(
+                "selected episode starts with {} active predicates, exceeding "
+                "continuous_subtasks.active_count {}".format(
+                    active_predicates, continuous["active_count"]
+                )
+            )
+        nodes = {node["id"]: node for node in episode["init_graph"].get("nodes", [])}
+        if not continuous["targets"]:
+            raise ValueError("continuous_subtasks.targets must contain at least one target")
+        seen_targets = set()
+        for target in continuous["targets"]:
+            required = {"relation", "object_id", "object_class", "capacity"}
+            if not isinstance(target, dict) or not required.issubset(target):
+                raise ValueError("each continuous target requires relation, object_id, object_class, capacity")
+            relation = target["relation"]
+            target_id = target["object_id"]
+            capacity = target["capacity"]
+            if relation not in ("on", "inside"):
+                raise ValueError("continuous target relation must be on or inside")
+            if type(target_id) is not int or type(capacity) is not int or capacity < 1:
+                raise ValueError("continuous target object_id and positive capacity must be integers")
+            node = nodes.get(target_id)
+            if node is None or node.get("class_name") != target["object_class"]:
+                raise ValueError(f"continuous target {target_id} does not match the episode graph")
+            required_property = "SURFACES" if relation == "on" else "CONTAINERS"
+            if required_property not in node.get("properties", []):
+                raise ValueError(f"continuous target {target_id} does not support {relation}")
+            key = (relation, target_id)
+            if key in seen_targets:
+                raise ValueError(f"duplicate continuous target {key}")
+            seen_targets.add(key)
     prompt_files = {}
     for role in ("alice", "bob"):
         raw = config.get(f"{role}_prompt_file")
@@ -115,6 +172,7 @@ def validate(config):
         "profile_id": profile_id,
         "profile_path": profile_path,
         "trace_mode": mode,
+        "continuous_subtasks": continuous,
         "prompt_files": prompt_files,
         "experiment_label": experiment_label,
         "port_request": requested_port,
@@ -194,6 +252,7 @@ def _summary(record_dir, index):
     summary["communication_reply_calls"] = 0
     summary["trace_updater_calls"] = 0
     summary["trace_updater_token_usage"] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    summary["continuous_subtasks"] = None
     for trajectory_file in trajectory_files:
         try:
             with trajectory_file.open("rb") as stream:
@@ -209,6 +268,8 @@ def _summary(record_dir, index):
         summary["trace_updater_calls"] += trace.get("updater_calls", 0)
         for key in summary["trace_updater_token_usage"]:
             summary["trace_updater_token_usage"][key] += trace.get("updater_token_usage", {}).get(key, 0)
+        if trajectory.get("continuous_subtasks") is not None:
+            summary["continuous_subtasks"] = trajectory["continuous_subtasks"]
     return summary
 
 
@@ -223,7 +284,8 @@ def main(argv=None):
     index = selected["episode_index"]
     print(f"WAH episode index={index}, task={episode['task_id']}_{episode['task_name']}, "
           f"env={episode['env_id']}, Bob profile={selected['profile_id']}, "
-          f"TRACE={selected['trace_mode']}, port={selected['port_request']}")
+          f"TRACE={selected['trace_mode']}, continuous={selected['continuous_subtasks']['enabled']}, "
+          f"port={selected['port_request']}")
     print(f"dataset={selected['dataset']}")
     print("planner_prompts=" + ", ".join(f"{role}:{path.name}" for role, path in selected["prompt_files"].items()))
     if args.check:
@@ -243,7 +305,9 @@ def _run_validated(config, selected, episode, index, port):
     task_name = _label(str(episode["task_name"]))
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     label = f"_{selected['experiment_label']}" if selected["experiment_label"] else ""
-    run_id = f"{task_name}_ep{index}_profile{profile_id}_trace-{selected['trace_mode']}{label}_{timestamp}"
+    continuous_label = "_continuous" if selected["continuous_subtasks"]["enabled"] else ""
+    run_id = (f"{task_name}_ep{index}_profile{profile_id}_trace-{selected['trace_mode']}"
+              f"{continuous_label}{label}_{timestamp}")
     category = "trace" if selected["trace_mode"] == "on" else "baseline"
     record_dir = CWAH_ROOT / "experiments" / category / run_id
     record_dir.mkdir(parents=True, exist_ok=False)
@@ -264,6 +328,7 @@ def _run_validated(config, selected, episode, index, port):
         "bob_profile_path": str(selected["profile_path"]) if selected["profile_path"] else None,
         "bob_profile_sha256": _sha256(selected["profile_path"]) if selected["profile_path"] else None,
         "trace_mode": selected["trace_mode"], "alice_model": config["alice_model"],
+        "continuous_subtasks": selected["continuous_subtasks"],
         "experiment_label": selected["experiment_label"],
         "planner_prompt_files": {role: str(path) for role, path in selected["prompt_files"].items()},
         "planner_prompt_sha256": {role: _sha256(path) for role, path in selected["prompt_files"].items()},
@@ -301,6 +366,20 @@ def _run_validated(config, selected, episode, index, port):
                "--test_task", str(index), "--trace-mode", selected["trace_mode"],
                "--alice-prompt-file", str(selected["prompt_files"]["alice"]),
                "--bob-prompt-file", str(selected["prompt_files"]["bob"])]
+    if selected["continuous_subtasks"]["enabled"]:
+        continuous_runtime = {
+            key: selected["continuous_subtasks"][key]
+            for key in (
+                "generation_mode", "max_generation_attempts",
+                "reverse_cooldown_steps", "targets",
+            )
+        }
+        command += [
+            "--continuous-subtasks",
+            "--continuous-active-count", str(selected["continuous_subtasks"]["active_count"]),
+            "--continuous-seed", str(selected["continuous_subtasks"]["seed"]),
+            "--continuous-config-json", json.dumps(continuous_runtime, separators=(",", ":")),
+        ]
     if selected["profile_path"]:
         command += ["--teammate-profile-file", str(selected["profile_path"])]
 
@@ -326,6 +405,9 @@ def _run_validated(config, selected, episode, index, port):
         f"# Experiment status\n\n- Outcome: {outcome}\n- WAH episode: {index} "
         f"({episode['task_id']}_{episode['task_name']}, environment {episode['env_id']})\n"
         f"- Bob profile: {profile_id}; TRACE: {selected['trace_mode']}\n"
+        f"- Continuous subtasks: {selected['continuous_subtasks']['enabled']}; "
+        f"active predicates: {selected['continuous_subtasks']['active_count']}; "
+        f"seed: {selected['continuous_subtasks']['seed']}\n"
         f"- Planner prompts: Alice `{selected['prompt_files']['alice'].name}`, "
         f"Bob `{selected['prompt_files']['bob'].name}`\n"
         f"- Success per run: {summary.get('success', 'unavailable')}\n"
