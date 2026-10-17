@@ -162,6 +162,11 @@ if __name__ == '__main__':
             test_results[episode_id] = {'S': S[episode_id],
                                         'L': L[episode_id],
                                         'cost_time': end_time-start_time}
+            if saved_info.get('interrupted'):
+                with open(args.record_dir + '/results.pik', 'wb') as stream:
+                    pickle.dump(test_results, stream)
+                print('[stop] Interrupted trajectory and results saved.', flush=True)
+                sys.exit(0)
 
 
         print('average steps (finishing the tasks):', np.array(steps_list).mean() if len(steps_list) > 0 else None)

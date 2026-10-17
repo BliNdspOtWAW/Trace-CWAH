@@ -41,6 +41,7 @@ def planner_output(acceptance_id=None, evidence_ids=()):
 
 TASK = {
     "subtask_id": "subtask-apple-table", "object_id": 12,
+    "created_step": 0,
     "object_class": "apple", "relation": "on", "target_id": 20,
     "target_class": "kitchentable",
 }
@@ -231,6 +232,90 @@ class TraceUpdaterTests(unittest.TestCase):
         self.assertEqual(capability["task_execution_events"][0]["status"], "completed")
         self.assertEqual(capability["task_execution_events"][0]["outcome"], "success")
 
+    def test_repeated_commitment_merges_and_counts_fulfillment_once(self):
+        updater, planner = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
+        first = updater.ledger.message(0, 1, 0, 'I will grab the apple.', 'active')
+        second = updater.ledger.message(1, 1, 0, 'I will grab it as agreed.', 'active')
+        answer = planner_output(first.event_id, [first.event_id])
+        answer['commitments'] += planner_output(second.event_id)['commitments']
+        planner.generator.return_value = ([json.dumps(answer)], 0)
+        updater.update()
+        records = updater.state.dimensions['reliability'].value['commitment_events']
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['acceptance_event_id'], first.event_id)
+        self.assertEqual(records[0]['accepted_step'], 0)
+        self.assertIn(second.event_id, records[0]['evidence_ids'])
+
+        updater.ledger.add(2, 'peer_task_progress', {
+            'task': TASK, 'observed_action': 'grab', 'status': 'in_progress',
+        })
+        state, _ = updater.update()
+        self.assertEqual(state.dimensions['reliability'].value['fulfillments'], 1)
+        third = updater.ledger.message(3, 1, 0, 'As promised, I grabbed it.', 'reply')
+        planner.generator.return_value = ([json.dumps(planner_output(third.event_id))], 0)
+        state, _ = updater.update()
+        value = state.dimensions['reliability'].value
+        self.assertEqual(len(value['commitment_events']), 1)
+        self.assertEqual(value['fulfillments'], 1)
+        self.assertEqual(value['commitment_events'][0]['status'], 'fulfilled')
+
+    def test_old_message_cannot_commit_to_future_subtask_or_fulfill_it(self):
+        updater, _ = self.make_updater(planner_output())
+        task = dict(TASK, subtask_id='S24', created_step=190)
+        old = updater.ledger.message(142, 1, 0, 'Cupcake for the fridge.', 'active')
+        updater.ledger.set_active_tasks([task])
+        proposal = dict(planner_output(old.event_id)['commitments'][0], subtask_id='S24')
+        commitments = {}
+        updater._accept_commitments([proposal], commitments)
+        updater.ledger.add(193, 'peer_task_progress', {'task': task, 'observed_action': 'grab'})
+        updater._settle_commitments(commitments)
+        self.assertEqual(commitments, {})
+
+        valid = updater.ledger.message(190, 1, 0, 'I will handle S24.', 'active')
+        proposal.update(acceptance_event_id=valid.event_id, evidence_ids=[valid.event_id])
+        updater._accept_commitments([proposal], commitments)
+        self.assertEqual(commitments['Bob:S24:grab']['accepted_step'], 190)
+        updater._settle_commitments(commitments)
+        self.assertEqual(commitments['Bob:S24:grab']['status'], 'fulfilled')
+
+        # An older re-extracted declaration must not replace the valid acceptance.
+        proposal.update(acceptance_event_id=old.event_id, evidence_ids=[old.event_id])
+        updater._accept_commitments([proposal], commitments)
+        self.assertEqual(commitments['Bob:S24:grab']['accepted_step'], 190)
+
+    def test_creation_time_survives_task_retirement_and_missing_time_is_rejected(self):
+        updater, _ = self.make_updater(planner_output())
+        task = dict(TASK, subtask_id='S24', created_step=190)
+        updater.ledger.set_active_tasks([task])
+        updater.ledger.task_completion(200, task, 'Bob')
+        updater.ledger.set_active_tasks([])
+        self.assertEqual(updater.ledger.subtask_created_step('S24'), 190)
+        updater.ledger.set_active_tasks([dict(TASK, subtask_id='missing', created_step=None)])
+        message = updater.ledger.message(201, 1, 0, 'I will handle it.', 'active')
+        proposal = dict(planner_output(message.event_id)['commitments'][0], subtask_id='missing')
+        commitments = {}
+        updater._accept_commitments([proposal], commitments)
+        self.assertEqual(commitments, {})
+
+    def test_alice_completion_closes_pending_without_violation(self):
+        updater, planner = self.make_updater(planner_output())
+        updater.ledger.set_active_tasks([TASK])
+        message = updater.ledger.message(0, 1, 0, 'I will grab and place the apple.', 'active')
+        answer = planner_output(message.event_id)
+        answer['commitments'].append(dict(answer['commitments'][0], action='place'))
+        planner.generator.return_value = ([json.dumps(answer)], 0)
+        updater.update()
+        updater.ledger.task_completion(1, TASK, 'Alice')
+        state, _ = updater.update()
+        value = state.dimensions['reliability'].value
+        self.assertEqual(len(value['commitment_events']), 2)
+        self.assertTrue(all(item['status'] == 'closed' and item['outcome'] == 'unknown'
+                            for item in value['commitment_events']))
+        self.assertEqual(value['fulfillments'], 0)
+        self.assertEqual(value['violations'], 0)
+        self.assertIsNone(value['fulfillment_rate'])
+
     def test_alice_completion_does_not_turn_bob_progress_into_failure(self):
         updater, _ = self.make_updater(planner_output())
         updater.ledger.set_active_tasks([TASK])
@@ -248,6 +333,43 @@ class TraceUpdaterTests(unittest.TestCase):
         self.assertEqual(execution["outcome"], "unknown")
         self.assertEqual(capability["failures"], 0)
         self.assertIsNone(capability["success_rate"])
+
+    def test_preference_every_third_call_and_null_rescores_existing_description(self):
+        updater, planner = self.make_updater(planner_output())
+        for index in range(1, 10):
+            answer = planner_output()
+            answer['preference'] = {'description': 'Frequently proposes task divisions.'
+                                    if index <= 3 else None}
+            answer['uncertainty']['preference'] = {3: 0.6, 6: 0.2, 9: 0.4}.get(index, 0.0)
+            planner.generator.return_value = ([json.dumps(answer)], 0)
+            updater.ledger.own_action(index, 'walk')
+            state, record = updater.update({'planner_type': 'reactive' if index % 2 else 'active'})
+            self.assertEqual(record['preference_assessment_due'], index % 3 == 0)
+            if index < 3:
+                self.assertEqual(state.dimensions['preference'].status, 'unknown')
+            else:
+                self.assertEqual(state.dimensions['preference'].value['description'],
+                                 'Frequently proposes task divisions.')
+                expected = 0.6 if index < 6 else 0.2 if index < 9 else 0.4
+                self.assertEqual(state.dimensions['preference'].uncertainty, expected)
+                self.assertEqual(state.dimensions['uncertainty'].value['per_dimension']['preference'], expected)
+        self.assertEqual(planner.generator.call_count, 9)
+        updater.update()
+        self.assertEqual(updater.call_count, 9)
+
+    def test_preference_assessment_keeps_all_intermediate_evidence_and_unknown_score(self):
+        updater, planner = self.make_updater(planner_output())
+        first = updater.ledger.message(0, 1, 0, 'UNIQUE_EARLY_BEHAVIOR', 'active')
+        updater.update()
+        for i in range(25):
+            updater.ledger.message(1, 1, 0, 'Later message {}'.format(i), 'active')
+        updater.update()
+        updater.ledger.own_action(2, 'walk')
+        state, record = updater.update()
+        self.assertIn('UNIQUE_EARLY_BEHAVIOR', record['llm_call']['prompt'])
+        self.assertIn(first.event_id, record['llm_call']['prompt'])
+        self.assertEqual(state.dimensions['preference'].status, 'unknown')
+        self.assertEqual(state.dimensions['uncertainty'].value['per_dimension']['preference'], 1.0)
 
     def test_policy_context_is_injected_into_existing_planner_prompt(self):
         planner = LLM.__new__(LLM)

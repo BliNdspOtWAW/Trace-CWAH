@@ -97,18 +97,9 @@ class LLM:
         self.api_base = env_api_base or sampling_parameters.api_base
         self.api_key = env_api_key or getattr(sampling_parameters, "api_key", None)
 
-        lm_id_lower = self.lm_id.lower()
-        self.chat = (
-            'gpt-3.5-turbo' in lm_id_lower
-            or 'gpt-4' in lm_id_lower
-            or 'qwen3-235b' in lm_id_lower
-            or 'qwen2.5' in lm_id_lower
-            or lm_id_lower.startswith("ds-")
-            or lm_id_lower.startswith("ds_")
-            or "deepseek" in lm_id_lower
-            or "deepseek-v3-0324" in lm_id_lower
-            or "qwen2.5-train" in lm_id_lower
-        )
+        # The configured backend selects the protocol. Model names are opaque
+        # API identifiers, including gateway aliases and future model names.
+        self.chat = self.source == 'openai'
         self.OPENAI_KEY = None
         self.total_cost = 0
         self.last_usage_metadata = None
@@ -528,8 +519,9 @@ class LLM:
         available_plans_refine = []
         if self.communication and message is not None:
             available_plans.append(f"[send_message] <{message}>")
-        for room in self.rooms:
-            if (room_explored is None or room_explored[room]) and unchecked_containers[room] is not None:
+        visits = getattr(self, 'room_visit_counts', {})
+        for room in sorted(self.rooms, key=lambda name: visits.get(name, 0)):
+            if room == getattr(self, 'current_room_name', None):
                 continue
             if location is not None:
                 dist = get_distance_xy(location, self.id2node[self.roomname2id[room]]["obj_transform"]["position"])
@@ -670,6 +662,13 @@ class LLM:
             goal_location_room, satisfied, opponent_grabbed_objects,
             opponent_last_room, room_explored,
         )
+        visits = getattr(self, 'room_visit_counts', {})
+        if visits:
+            progress += (
+                '\nRoom visits (counted on entry): ' + json.dumps(visits) +
+                '. Revisit rooms when useful; prefer less-visited rooms when searching '
+                'without a stronger location clue.'
+            )
         _, _, with_distance, refined, _ = self.get_available_plans(
             location, grabbed_objects, unchecked_containers, ungrabbed_objects,
             None, room_explored, put_options=put_options,

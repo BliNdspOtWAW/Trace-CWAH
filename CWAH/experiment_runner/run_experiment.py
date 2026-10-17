@@ -11,6 +11,7 @@ import re
 import socket
 import subprocess
 import sys
+import signal
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -232,6 +233,16 @@ def allocated_port(requested_port):
 def _summary(record_dir, index):
     path = record_dir / "results.pik"
     if not path.exists():
+        checkpoint = record_dir / 'trajectory_checkpoint.pik'
+        if checkpoint.exists():
+            with checkpoint.open('rb') as stream:
+                partial = pickle.load(stream)
+            return {
+                'status': 'interrupted', 'episode_index': index,
+                'steps': [partial.get('environment_steps', 0)],
+                'trajectories': [checkpoint.name],
+                'termination_reason': partial.get('termination_reason') or 'incomplete',
+            }
         return {"status": "no_results", "episode_index": index}
     try:
         with path.open("rb") as stream:
@@ -261,6 +272,9 @@ def _summary(record_dir, index):
             summary.setdefault("unreadable_trajectories", []).append(trajectory_file.name)
             continue
         llm_calls = trajectory.get("LLM", {})
+        if trajectory.get('interrupted'):
+            summary['status'] = 'interrupted'
+            summary['termination_reason'] = 'interrupted'
         summary["planner_calls"]["alice"] += len(llm_calls.get(0, []))
         summary["planner_calls"]["bob"] += len(llm_calls.get(1, []))
         summary["communication_reply_calls"] += trajectory.get("communication_calls", 0)
@@ -387,20 +401,33 @@ def _run_validated(config, selected, episode, index, port):
     with (record_dir / "console.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=GAME_ROOT, env=child_env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
-        for line in process.stdout:
-            log.write(line)
-            step_match = re.match(r"^Step (\d+), Executing script:", line)
-            if step_match:
-                step = int(step_match.group(1)) + 1
-                print(f"[progress] {run_id} step={step}/{config['max_episode_length']}", flush=True)
-                log.flush()
-            elif line.startswith(("Init Env", "episode:", "success", "failure", "steps:")):
-                print(line, end="", flush=True)
-        exit_code = process.wait()
+        previous_handlers = {}
+        def forward_stop(signum, frame):
+            if process.poll() is None:
+                process.send_signal(signum)
+                print('[stop] Waiting for the current step and trajectory save.', flush=True)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[sig] = signal.signal(sig, forward_stop)
+        try:
+            for line in process.stdout:
+                log.write(line)
+                step_match = re.match(r"^Step (\d+), Executing script:", line)
+                if step_match:
+                    step = int(step_match.group(1)) + 1
+                    print(f"[progress] {run_id} step={step}/{config['max_episode_length']}", flush=True)
+                    log.flush()
+                elif line.startswith(("Init Env", "episode:", "success", "failure", "steps:", "[stop]")):
+                    print(line, end="", flush=True)
+            exit_code = process.wait()
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
     summary = _summary(record_dir, index)
     summary["runner_exit_code"] = exit_code
     (record_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    outcome = "completed" if exit_code == 0 and summary["status"] == "completed" and summary["runs"] == config["num_runs"] else "failed"
+    outcome = ('interrupted' if summary['status'] == 'interrupted' else
+               'completed' if exit_code == 0 and summary['status'] == 'completed'
+               and summary['runs'] == config['num_runs'] else 'failed')
     (record_dir / "status.md").write_text(
         f"# Experiment status\n\n- Outcome: {outcome}\n- WAH episode: {index} "
         f"({episode['task_id']}_{episode['task_name']}, environment {episode['env_id']})\n"

@@ -1,4 +1,5 @@
 from LLM import *
+import copy
 from LLM.communication import CommunicationModule
 from trace_tf.updater import HybridUpdater
 from trace_tf.policy import render_policy_context, render_reply_context
@@ -86,12 +87,25 @@ class LLM_agent:
 
 	def _remove_cached_object(self, object_id):
 		"""Invalidate every remembered room location for one observed/stale object."""
+		if object_id in getattr(self, 'object_memory', {}):
+			self.object_memory[object_id]['location_valid'] = False
 		for room, objects in getattr(self, 'ungrabbed_objects', {}).items():
 			if objects is not None:
 				self.ungrabbed_objects[room] = [item for item in objects if item['id'] != object_id]
 
 	def _prune_ungrabbed_memory(self):
-		"""Keep remote memory, but only expose objects relevant to active unfinished goals."""
+		"""Rebuild task candidates from persistent legal object memory."""
+		if hasattr(self, 'object_memory'):
+			for room, objects in self.ungrabbed_objects.items():
+				remembered = []
+				for entry in self.object_memory.values():
+					entry['task_relevant'] = self._matches_unsatisfied_goal(entry['node'])
+					if (entry['room'] == room and entry['location_valid']
+							and not entry.get('held_by') and entry['task_relevant']):
+						remembered.append(entry['node'])
+				if objects is not None or remembered:
+					self.ungrabbed_objects[room] = remembered
+			return
 		for room, objects in getattr(self, 'ungrabbed_objects', {}).items():
 			if objects is not None:
 				self.ungrabbed_objects[room] = [
@@ -233,6 +247,8 @@ class LLM_agent:
 
 
 	def LLM_plan(self, location):
+		self.LLM.room_visit_counts = dict(getattr(self, 'room_visit_counts', {}))
+		self.LLM.current_room_name = self.current_room['class_name']
 		put_options = self._put_options()
 		source_event_ids = self._trace_source_event_ids()
 		information = self.LLM.build_decision_information(
@@ -317,6 +333,7 @@ class LLM_agent:
 		satisfied, unsatisfied = self.check_progress(observation, goal)
 		self.unsatisfied = unsatisfied
 		self.satisfied = satisfied
+		self._remember_observation(observation)
 		self._prune_ungrabbed_memory()
 		obs = self.filter_graph(observation)
 		self.grabbed_objects = []
@@ -341,7 +358,9 @@ class LLM_agent:
 		for x in obs['nodes']:
 			# A direct observation supersedes every remembered room location for
 			# this object. The current-room cache is rebuilt below when relevant.
-			self._remove_cached_object(x['id'])
+			for room, objects in self.ungrabbed_objects.items():
+				if objects is not None:
+					self.ungrabbed_objects[room] = [item for item in objects if item['id'] != x['id']]
 			if x['id'] in self.grabbed_objects or x['id'] in [w['id'] for w in opponent_grabbed_objects]:
 				continue
 			self.id_inside_room[x['id']] = self.current_room['class_name']
@@ -377,6 +396,8 @@ class LLM_agent:
 						"current_room": self.current_room['class_name'],
 						},
 				}
+		info['obs']['room_visit_counts'] = dict(self.room_visit_counts)
+		info['obs']['object_memory'] = copy.deepcopy(self.object_memory)
 		if self.id_inside_room[self.opponent_agent_id] == self.current_room['class_name']:
 			self.opponent_grabbed_objects = opponent_grabbed_objects
 		action = None
@@ -450,6 +471,34 @@ class LLM_agent:
 		self.dialogue_history.append(f"{self.agent_names[event['sender'] + 1]}: {event['text']}")
 		if self.trace is not None:
 			self.trace.ledger.message(event['step'], event['sender'], event['receiver'], event['text'], event['kind'])
+
+	def _remember_observation(self, observation):
+		"""Retain every observed movable object, independently of the active task."""
+		if not hasattr(self, 'object_memory'):
+			self.object_memory = {}
+		if not hasattr(self, 'room_visit_counts'):
+			self.room_visit_counts = {room: 0 for room in self.rooms_name}
+		nodes = {node['id']: node for node in observation['nodes']}
+		room_id = next((edge['to_id'] for edge in observation['edges']
+			if edge['from_id'] == self.agent_id and edge['relation_type'] == 'INSIDE'
+			and nodes.get(edge['to_id'], {}).get('category') == 'Rooms'), None)
+		room = nodes.get(room_id, {}).get('class_name')
+		if room is None:
+			return
+		if room != getattr(self, '_last_observed_room', None):
+			self.room_visit_counts[room] = self.room_visit_counts.get(room, 0) + 1
+		self._last_observed_room = room
+		held = {edge['to_id']: edge['from_id'] for edge in observation['edges']
+			if edge['relation_type'].startswith('HOLDS')}
+		for node in observation['nodes']:
+			if 'GRABBABLE' in node.get('properties', []):
+				self.object_memory[node['id']] = {
+					'node': copy.deepcopy(node), 'room': room,
+					'last_seen_step': self.steps, 'held_by': held.get(node['id']),
+					'location_valid': True,
+					'task_relevant': self._matches_unsatisfied_goal(node),
+				}
+				self.id_inside_room[node['id']] = room
 
 	def observe_trace_outcome(self, observation, step):
 		if self.trace is not None:
@@ -561,6 +610,9 @@ class LLM_agent:
         # goal: {'on_pudding_<coffeetable> (268)': [1, True, 2], 'on_juice_<coffeetable> (268)': [1, True, 2], 'on_apple_<coffeetable> (268)': [1, True, 2], 'on_cupcake_<coffeetable> (268)': [2, True, 2]}
 		self.steps = 0
 		self.completed_goals = []
+		self.object_memory = {}
+		self.room_visit_counts = {room: 0 for room in rooms_name}
+		self._last_observed_room = None
 		self.containers_name = containers_name
 		self.goal_objects_name = goal_objects_name
 		self.rooms_name = rooms_name

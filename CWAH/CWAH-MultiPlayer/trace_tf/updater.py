@@ -28,6 +28,9 @@ class HybridUpdater:
         self.cursor = 0
         self.update_log = []
         self.last_context = ""
+        self.call_count = 0
+        self.preference_cursor = 0
+        self.preference_due = False
 
     def _evidence(self, events):
         evidence = []
@@ -101,9 +104,21 @@ class HybridUpdater:
         if observations:
             selected.append(observations[-1])
         selected.sort(key=lambda e: int(e.event_id[1:]))
+        self.call_count += 1
+        self.preference_due = self.call_count % 3 == 0
+        preference_events = self.ledger.since(self.preference_cursor)
+        preference_instruction = (
+            'Evaluate Preference this call using the prior description and uncertainty. '
+            'New legal behavior since the previous Preference assessment: '
+            + json.dumps(self._prompt_events(preference_events), ensure_ascii=False)
+            if self.preference_due else
+            'Do not evaluate Preference this call. Omit preference and '
+            'uncertainty.preference; the runtime retains both previous values.'
+        )
         prompt = PROMPT.replace("$INFORMATION", json.dumps(information, ensure_ascii=False))
         prompt = prompt.replace("$BELIEF", json.dumps(self._compact_prior(), ensure_ascii=False))
         prompt = prompt.replace("$EVENTS", json.dumps(self._prompt_events(selected), ensure_ascii=False))
+        prompt = prompt.replace("$PREFERENCE_ASSESSMENT", preference_instruction)
         sampling = self.planner.sampling_params
         params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
         params["n"] = 1
@@ -176,7 +191,15 @@ class HybridUpdater:
                         and subtask_id not in self.ledger.known_subtask_ids())
                     or not self._valid_events(item.get("evidence_ids", []))):
                 continue
-            commitment_id = "{}:{}:{}".format(key, subtask_id or "none", action)
+            if subtask_id is not None:
+                created_step = self.ledger.subtask_created_step(subtask_id)
+                # An older message cannot commit to a future task. Unknown
+                # creation time cannot justify accepting that association.
+                if created_step is None or accepted.step < created_step:
+                    continue
+            # A concrete responsibility survives repeated confirmations. Unbound
+            # searches have no task identity, so keep their message identity.
+            commitment_id = "Bob:{}:{}".format(subtask_id or key, action)
             proposed = item.get("proposed_status")
             if proposed not in ("pending", "fulfilled", "violated", "unverifiable"):
                 proposed = "unverifiable"
@@ -184,13 +207,24 @@ class HybridUpdater:
                 commitments[commitment_id] = {
                     "commitment_id": commitment_id, "acceptance_event_id": key,
                     "subtask_id": subtask_id, "action": action, "object": obj,
-                    "status": "pending",
+                    "actor": "Bob", "accepted_step": accepted.step,
+                    "status": "pending", "outcome": "unknown",
                     "evidence_ids": [key], "llm_proposed_status": proposed,
                     "llm_evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
                 }
             else:
-                commitments[commitment_id]["llm_proposed_status"] = proposed
-                commitments[commitment_id]["llm_evidence_ids"] = list(dict.fromkeys(item["evidence_ids"]))
+                existing = commitments[commitment_id]
+                earliest = by_id[existing["acceptance_event_id"]]
+                if int(accepted.event_id[1:]) < int(earliest.event_id[1:]):
+                    existing["acceptance_event_id"] = key
+                    existing["accepted_step"] = accepted.step
+                existing["evidence_ids"] = list(dict.fromkeys(
+                    existing["evidence_ids"] + [key]
+                ))
+                existing["llm_proposed_status"] = proposed
+                existing["llm_evidence_ids"] = list(dict.fromkeys(
+                    existing.get("llm_evidence_ids", []) + item["evidence_ids"]
+                ))
 
     def _settle_commitments(self, commitments):
         for commitment in commitments.values():
@@ -201,6 +235,17 @@ class HybridUpdater:
                 outcome = event.payload
                 if event.step < accepted_step:
                     continue
+                if (event.kind == "task_completion"
+                        and (outcome.get("task") or {}).get("subtask_id")
+                        == commitment.get("subtask_id")
+                        and outcome.get("completed_by") == "Alice"):
+                    commitment.update({
+                        "status": "closed", "outcome": "unknown",
+                        "closure_reason": "completed_by_Alice",
+                        "settlement_event_id": event.event_id,
+                    })
+                    commitment["evidence_ids"].append(event.event_id)
+                    break
                 matched = False
                 if event.kind == "peer_task_progress":
                     task = outcome.get("task") or {}
@@ -230,6 +275,10 @@ class HybridUpdater:
                 elif outcome.get("success") is False and outcome.get("terminal") is True:
                     commitment["status"] = "violated"
                 if commitment["status"] != "pending":
+                    commitment["outcome"] = (
+                        "success" if commitment["status"] == "fulfilled" else "failure"
+                    )
+                    commitment["settlement_event_id"] = event.event_id
                     commitment["evidence_ids"].append(event.event_id)
                     break
 
@@ -300,19 +349,17 @@ class HybridUpdater:
             proposals = {}
         uncertainties = {}
 
-        for dimension in ("intent", "preference"):
+        for dimension in ("intent",):
             entry = inference.get(dimension, {})
             entry = entry if isinstance(entry, dict) else {}
             events = self._peer_evidence(self._valid_events(entry.get("evidence_ids", [])))
-            value = entry.get("action") if dimension == "intent" else entry.get("description")
-            if dimension == "intent" and value not in ACTIONS:
-                value = None
-            if dimension == "preference" and (not isinstance(value, str) or len(events) < 2):
+            value = entry.get("action")
+            if value not in ACTIONS:
                 value = None
             if value is not None and events:
                 floor = 1.0 / (len(events) + 1)
                 u = max(_unit(proposals.get(dimension)), floor)
-                detail = {"action": value, "target": entry.get("target")} if dimension == "intent" else {"description": value}
+                detail = {"action": value, "target": entry.get("target")}
                 self._apply(dimension, detail, u, events)
                 uncertainties[dimension] = u
             else:
@@ -323,6 +370,28 @@ class HybridUpdater:
                         self.state = self.state.with_unknown("intent", withdrawal)
                 prior = self.state.dimensions[dimension]
                 uncertainties[dimension] = 1.0 if prior.status == "unknown" or prior.uncertainty is None else prior.uncertainty
+
+        prior = self.state.dimensions['preference']
+        entry = inference.get('preference')
+        if (self.preference_due and isinstance(entry, dict)
+                and 'description' in entry and 'preference' in proposals):
+            description = entry.get('description')
+            if isinstance(description, str) and description.strip():
+                value = {'description': description.strip()}
+            else:
+                value = prior.value if prior.status == 'supported' else None
+            if value is not None:
+                u = _unit(proposals.get('preference'))
+                # Attach input provenance for audit, without asking the model
+                # for evidence IDs or gating acceptance on peer-event counts.
+                self._apply('preference', value, u,
+                            self.ledger.since(self.preference_cursor))
+            self.preference_cursor = len(self.ledger.events)
+        preference = self.state.dimensions['preference']
+        uncertainties['preference'] = (
+            preference.uncertainty if preference.status == 'supported'
+            and preference.uncertainty is not None else 1.0
+        )
 
         executions = self._capability_executions()
         successes = sum(item.get("outcome") == "success" for item in executions.values())
@@ -362,6 +431,8 @@ class HybridUpdater:
         self._apply("uncertainty", {"per_dimension": uncertainties, "overall": overall},
                     overall, new)
         record = {"new_event_ids": [e.event_id for e in new], "belief_before": before,
-                  "belief_after": self.state.to_dict(), "llm_call": call}
+                  "belief_after": self.state.to_dict(), "llm_call": call,
+                  "updater_call_index": self.call_count,
+                  "preference_assessment_due": self.preference_due}
         self.update_log.append(record)
         return self.state, record

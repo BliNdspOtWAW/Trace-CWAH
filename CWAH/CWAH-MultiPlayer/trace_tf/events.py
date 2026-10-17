@@ -28,6 +28,7 @@ class EvidenceLedger:
         self._observed_steps = set()
         self._prior_observation: Optional[Dict[str, Any]] = None
         self._active_tasks: List[Dict[str, Any]] = []
+        self._known_tasks: Dict[str, Dict[str, Any]] = {}
 
     def add(self, step, kind, payload):
         if kind not in ("observation", "message", "own_action", "peer_task_progress",
@@ -41,6 +42,22 @@ class EvidenceLedger:
     def set_active_tasks(self, tasks):
         """Provide only the public active-task snapshot used by both agents."""
         self._active_tasks = _json_copy(list(tasks or []))
+        for task in self._active_tasks:
+            if task.get('subtask_id'):
+                self._known_tasks[task['subtask_id']] = self._task_payload(task)
+
+    def subtask_created_step(self, subtask_id):
+        task = self._known_tasks.get(subtask_id, {})
+        created = task.get('created_step')
+        if type(created) is int and created >= 0:
+            return created
+        for event in self.events:
+            task = event.payload.get('task') or {}
+            if task.get('subtask_id') == subtask_id:
+                created = task.get('created_step')
+                if type(created) is int and created >= 0:
+                    return created
+        return None
 
     def _task_for_object(self, object_id):
         return next(
@@ -63,6 +80,7 @@ class EvidenceLedger:
             return None
         return {
             "subtask_id": task.get("subtask_id"),
+            "created_step": task.get("created_step"),
             "object_id": task.get("object_id"),
             "object_class": task.get("object_class"),
             "relation": task.get("relation"),

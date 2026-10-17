@@ -9,6 +9,7 @@ import time
 import json
 import atexit
 import re
+import signal
 
 # @ray.remote
 class ArenaMP(object):
@@ -485,7 +486,46 @@ class ArenaMP(object):
                         peer.receive_dialogue_event(event)
         return events
 
-    def run(self, random_goal=False, pred_goal=None, cnt_subgoal_info = False):
+    def run(self, random_goal=False, pred_goal=None, cnt_subgoal_info=False):
+        self._stop_signal = None
+        previous = {}
+        def request_stop(signum, frame):
+            self._stop_signal = signum
+            print('[stop] Stop requested; saving after the current environment step.', flush=True)
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, request_stop)
+        try:
+            return self._run_episode(random_goal, pred_goal, cnt_subgoal_info)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def _save_checkpoint(self, saved_info):
+        """Atomically preserve the last fully recorded step, including TRACE."""
+        snapshot = dict(saved_info)
+        snapshot['environment_steps'] = len(saved_info['action'].get(0, []))
+        if self.agents and getattr(self.agents[0], 'trace', None) is not None:
+            trace = self.agents[0].trace
+            calls = [entry['llm_call'] for entry in trace.update_log if entry['llm_call']]
+            snapshot['trace'] = {
+                'evidence_events': [event.to_dict() for event in trace.ledger.events],
+                'belief_updates': trace.update_log,
+                'final_belief': trace.state.to_dict(),
+                'updater_calls': len(calls),
+                'updater_token_usage': {
+                    key: sum((call.get('usage') or {}).get(key) or 0 for call in calls)
+                    for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+                },
+            }
+        if getattr(self.env, 'continuous_subtasks_enabled', False):
+            snapshot['continuous_subtasks'] = self.env.continuous_subtasks_summary()
+        os.makedirs(self.record_dir, exist_ok=True)
+        path = os.path.join(self.record_dir, 'trajectory_checkpoint.pik')
+        with open(path + '.tmp', 'wb') as stream:
+            pickle.dump(snapshot, stream, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(path + '.tmp', path)
+
+    def _run_episode(self, random_goal=False, pred_goal=None, cnt_subgoal_info = False):
         """
         self.task_goal: goal inference
         self.env.task_goal: ground-truth goal
@@ -593,6 +633,13 @@ class ArenaMP(object):
                     saved_info['graph'][agent_id].append(copy.deepcopy(info['graph']))
                 if self.debug:
                     pickle.dump(saved_info, open(os.path.join(self.record_dir, 'log.pik'), 'wb'))
+            if self._stop_signal is not None:
+                saved_info['termination_reason'] = 'interrupted'
+                saved_info['interrupted'] = True
+                saved_info['stop_signal'] = self._stop_signal
+                success = False
+                done = True
+            self._save_checkpoint(saved_info)
             if done:
                 break
         saved_info['finished'] = success

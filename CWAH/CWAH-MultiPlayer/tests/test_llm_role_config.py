@@ -9,6 +9,26 @@ from LLM.LLM import LLM, resolve_profile_key
 
 
 class LLMRoleConfigTests(unittest.TestCase):
+    def test_openai_backend_passes_arbitrary_model_names_to_chat_api(self):
+        args = SimpleNamespace(
+            debug=False, act=False, big_5=None, api_base='https://example.invalid/v1',
+            api_key='test-key', max_tokens=128, t=0, top_p=1, n=1,
+        )
+        messages = [{'role': 'user', 'content': 'test'}]
+        response = {'choices': [{'message': {'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2}}
+        for model in ('gpt-5', 'custom-provider/model-alias', 'deepseek-ai/DeepSeek-V3.1'):
+            with self.subTest(model=model), patch.dict(os.environ, {}, clear=True), \
+                    patch('openai.ChatCompletion.create', return_value=response) as chat_api, \
+                    patch('openai.Completion.create') as legacy_api:
+                planner = LLM('openai', model, 'unused', True, False, args, 1)
+                output, _ = planner.generator(messages, planner.sampling_params)
+                self.assertTrue(planner.chat)
+                self.assertEqual(output, ['ok'])
+                self.assertEqual(chat_api.call_args.kwargs['model'], model)
+                self.assertEqual(chat_api.call_args.kwargs['messages'], messages)
+                legacy_api.assert_not_called()
+
     def test_profile_override_uses_real_task_and_source_cluster(self):
         values = {
             "CWAH_PROFILE_SOURCE_TASK": "26_prepare_food",

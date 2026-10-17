@@ -44,8 +44,29 @@ commitment is bound to the public `subtask_id`, so a different task involving
 the same object class cannot fulfill it. Commitments are stored only under Reliability beside
 its verified fulfillment rate; they are not a seventh belief dimension or a
 separate plan state. Pending or unverified commitments do not enter that rate.
+Repeated declarations of the same `(Bob, subtask_id, action)` merge into one
+commitment with the earliest acceptance and all confirmation evidence. Grab
+and place remain distinct responsibilities. A pending commitment whose task
+is completed by Alice becomes `closed / unknown`, outside both success and
+violation counts. Settled commitments are never settled or counted again.
+Search commitments without a concrete subtask retain message-based identity.
+Concrete commitments require a known public task creation time and a Bob
+acceptance message at or after that time. An old declaration cannot be rebound
+to a future subtask or move a valid acceptance back before task creation.
 Each uncertainty is in `[0,1]`, where 1 means unknown; the overall score is the
 arithmetic mean of Intent, Capability, Preference, and Reliability uncertainty.
+
+Preference is assessed only on calls 3, 6, 9, etc. of the shared Active/Reactive
+updater. Each assessment receives the prior description/uncertainty and legal
+events accumulated since the previous assessment, even beyond the normal
+20-event recent window. It returns only a concise `description` (or null to
+retain it) and a new Preference uncertainty. Description acceptance has no
+model-supplied evidence-ID requirement; input provenance is retained for audit.
+A null description can still rescore an existing belief. With no established
+description, null remains unknown with uncertainty 1. Other calls inherit both
+values. Supporting behavior may reduce uncertainty, conflicting behavior may
+raise it; elapsed calls alone are not evidence. Failed assessments retain the
+event backlog for the next scheduled assessment.
 
 `policy.py` adds only the inferred teammate-belief portion to the Information
 already rendered by Alice's active or reactive planner. With TRACE off, the

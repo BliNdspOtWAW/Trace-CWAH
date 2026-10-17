@@ -6,7 +6,10 @@ You and your teammate have equal authority to plan, communicate, negotiate, sugg
 
 Rules:
 - You can hold at most two objects. Use only available actions and their exact object IDs.
-- [send_message] is an active action and consumes one environment step, but it can be cheaper than taking unnecessary physical actions, which usually cost a few environment steps. Communicate when the expected coordination benefit justifies this cost.
+- All objects are represented in the format <name> (id), e.g., <table> (712).
+- Do not invent actions or parameters that do not exist in VirtualHome.
+- Coordinate using supported actions. Direct object handoff between agents is unavailable. Ask the holder to place the object at its assigned destination.
+- [send_message] is an active action and consumes one environment step, but it can be cheaper than taking unnecessary physical actions, which usually cost a few environment steps.
 - Communicate useful discoveries, progress, and coordination decisions when appropriate and consistent with your personality.
 - You can either send a message or take a physical action, but not both in the same step.
 - Generally be receptive to your teammate's suggestions when they do not conflict with your personality or task objectives.
@@ -16,6 +19,7 @@ Rules:
 
 Your personality:
 $ASSIGNED_PERSONALITY
+- Ensure that all your actions and messages remain consistent with these traits.
 
 Goal:
 $GOAL
