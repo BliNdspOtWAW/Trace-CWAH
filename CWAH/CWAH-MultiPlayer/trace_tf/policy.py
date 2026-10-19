@@ -3,15 +3,35 @@
 import json
 
 
+BELIEF_DIMENSIONS = (
+    "Belief dimensions:\n\n"
+    "- **Intent:** Bob's likely current high-level action or objective.\n"
+    "- **Capability:** Bob's observed ability to execute tasks successfully.\n"
+    "- **Preference:** Bob's inferred recurring behavioral tendencies in communication, "
+    "coordination, delegation, initiative, and responsiveness.\n"
+    "- **Reliability:** Bob's explicit task commitments and their verified fulfillment.\n"
+    "- **Uncertainty:** The uncertainty of each estimate "
+    "(0 = well supported, 1 = unknown or unsupported).\n\n"
+    "Treat uncertain estimates cautiously. Distinguish inferred intentions, "
+    "explicit commitments, and verified outcomes.\n\n"
+)
+
+
+def _recent_bob_evidence(ledger, limit):
+    return [event.to_dict() for event in ledger.events
+            if event.kind in ('peer_task_progress', 'peer_task_outcome')
+            or (event.kind == 'message' and event.payload.get('sender') == ledger.peer_id)
+            or (event.kind == 'task_completion'
+                and event.payload.get('completed_by') == 'Bob')][-limit:]
+
+
 def render_policy_context(state, ledger):
     dims = state.dimensions
     if dims["information"].status == "unknown":
         return "TRACE belief has no evidence yet. Do not assume anything about Bob."
     # Information is already rendered through the planner's normal Goal/Progress/
     # History fields. Inject only the inferred teammate belief here.
-    recent = [event.to_dict() for event in ledger.events
-              if event.kind in ("message", "peer_task_progress", "peer_task_outcome",
-                                "task_completion")][-8:]
+    recent = _recent_bob_evidence(ledger, 8)
     values = {}
     for name in ("intent", "capability", "preference", "reliability"):
         item = dims[name]
@@ -26,21 +46,18 @@ def render_policy_context(state, ledger):
         "value": dims["uncertainty"].value,
     }
     return (
-        "TRACE teammate belief about Bob, derived from the Information above:\n"
-        "Use it for coordination, communication, and action planning when relevant.\n"
-        "Intent: Bob's likely current high-level action.\n"
-        "Capability: Bob's observed task-execution ability.\n"
-        "Preference: Bob's inferred behavioral and collaboration tendencies.\n"
-        "Reliability: Bob's explicit commitments and their verified fulfillment.\n"
-        "Uncertainty: Uncertainty in each inference (0 = certain, 1 = unknown).\n"
-        "Treat uncertain estimates cautiously and distinguish intent from commitment.\n"
-        "Recent attributable Bob evidence: " + json.dumps(recent, ensure_ascii=False) + "\n"
-        "Teammate belief: " + json.dumps(values, ensure_ascii=False)
+        "TRACE teammate belief about Bob, derived from Alice's available information:\n\n"
+        "Use this belief to inform coordination decisions when relevant. Adapt your actions, "
+        "communication, delegation, or verification strategy based on the TRACE belief "
+        "when appropriate.\n\n"
+        + BELIEF_DIMENSIONS
+        + "Recent attributable Bob evidence:\n" + json.dumps(recent, ensure_ascii=False) + "\n\n"
+        + "Teammate belief:\n" + json.dumps(values, ensure_ascii=False)
     )
 
 
 def render_reply_context(state, ledger):
-    """Render a compact teammate belief for message-triggered deliberation."""
+    """Render teammate belief for message-triggered deliberation."""
     dims = state.dimensions
     if dims["information"].status == "unknown":
         return "TRACE belief has no evidence yet. Do not assume anything about Bob."
@@ -58,12 +75,13 @@ def render_reply_context(state, ledger):
         "status": uncertainty.status,
         "value": uncertainty.value,
     }
-    recent = [event.to_dict() for event in ledger.events
-              if event.kind in ("message", "peer_task_progress", "peer_task_outcome",
-                                "task_completion")][-4:]
+    recent = _recent_bob_evidence(ledger, 4)
     return (
-        "Use this belief, derived from the same Information shown above, when relevant. "
-        "Treat uncertain inferences cautiously and do not present them as verified facts.\n"
-        "Recent attributable evidence: " + json.dumps(recent, ensure_ascii=False) + "\n"
-        "Teammate belief: " + json.dumps(values, ensure_ascii=False)
+        "TRACE teammate belief about Bob, derived from Alice's available information:\n\n"
+        "Use this belief to inform your response and coordination decisions when relevant. "
+        "Consider whether to maintain or revise your intended actions and coordination "
+        "strategy based on the TRACE belief and the newly received message.\n\n"
+        + BELIEF_DIMENSIONS
+        + "Recent attributable Bob evidence:\n" + json.dumps(recent, ensure_ascii=False) + "\n\n"
+        + "Teammate belief:\n" + json.dumps(values, ensure_ascii=False)
     )

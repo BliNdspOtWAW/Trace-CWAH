@@ -56,8 +56,8 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertEqual(selected["episode"]["task_id"], 44)
             self.assertEqual(selected["profile_path"], profile)
             self.assertEqual(selected["port_request"], "auto")
-            self.assertEqual(selected["prompt_files"]["alice"].name, "prompt_Peer.txt")
-            self.assertEqual(selected["prompt_files"]["bob"].name, "prompt_Peer.txt")
+            self.assertEqual(selected["prompt_files"]["alice"].name, "prompt_Alice.txt")
+            self.assertEqual(selected["prompt_files"]["bob"].name, "prompt_Bob.txt")
             with patch.dict(os.environ, {"CWAH_PROFILE_SOURCE_TASK": "26_prepare_food",
                                       "CWAH_PROFILE_EXPECTED_TASK": "50_prepare_food"}):
                 args = SimpleNamespace(debug=False, act=False, big_5=None,
@@ -83,14 +83,15 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertIn("You must send a message", bob.prompt_template)
         self.assertNotIn("$AGENT_NAME", bob.prompt_template)
 
-    def test_official_configs_use_unified_peer_prompt(self):
+    def test_official_configs_use_role_defaults_or_explicit_overrides(self):
         config_dir = Path(__file__).resolve().parents[2] / "experiment_runner" / "configs"
         configs = [json.loads(path.read_text()) for path in sorted(config_dir.glob("*.json"))]
         self.assertTrue(configs)
         for config in configs:
             selected = validate(config)
-            self.assertEqual(selected["prompt_files"]["alice"].name, "prompt_Peer.txt")
-            self.assertEqual(selected["prompt_files"]["bob"].name, "prompt_Peer.txt")
+            for role in ('alice', 'bob'):
+                expected = Path(config.get(f'{role}_prompt_file') or f'prompt_{role.title()}.txt').name
+                self.assertEqual(selected['prompt_files'][role].name, expected)
 
     def test_trace_switch_controls_updater(self):
         room = {"id": 11, "class_name": "kitchen", "category": "Rooms"}

@@ -152,7 +152,7 @@ class PeerCommunicationTests(unittest.TestCase):
                 "Any update?", [], None, None, {"nodes": [], "edges": []}, agent_id=1,
             )
 
-    def test_both_agents_share_peer_prompt(self):
+    def test_role_prompts_and_reply_prompts_are_selected(self):
         args = SimpleNamespace(debug=False, act=False, big_5=None, api_base=None, api_key=None)
         alice = LLM("debug", "test", "unused", True, False, args, 1)
         bob = LLM("debug", "test", "unused", True, False, args, 2)
@@ -161,6 +161,16 @@ class PeerCommunicationTests(unittest.TestCase):
         self.assertIn("reasonable consistency", alice.prompt_template)
         self.assertNotIn("$AGENT_NAME", alice.prompt_template)
         self.assertNotIn("$AGENT_NAME", bob.prompt_template)
+        self.assertTrue(alice.prompt_template_path.endswith('prompt_Alice.txt'))
+        self.assertTrue(bob.prompt_template_path.endswith('prompt_Bob.txt'))
+        self.assertNotIn('$ASSIGNED_PERSONALITY', alice.prompt_template)
+        self.assertIn('$ASSIGNED_PERSONALITY', bob.prompt_template)
+        alice_reply = CommunicationModule(alice)
+        bob_reply = CommunicationModule(bob)
+        self.assertEqual(alice_reply.prompt_path.name, 'prompt_Reply_Alice.txt')
+        self.assertEqual(bob_reply.prompt_path.name, 'prompt_Reply_Bob.txt')
+        self.assertNotIn('$ASSIGNED_PERSONALITY', alice_reply.prompt_template)
+        self.assertIn('$ASSIGNED_PERSONALITY', bob_reply.prompt_template)
 
     def test_planning_prompt_contains_oldest_and_newest_messages(self):
         planner = LLM.__new__(LLM)

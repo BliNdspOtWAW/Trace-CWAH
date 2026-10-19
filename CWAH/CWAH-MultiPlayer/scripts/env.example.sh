@@ -9,11 +9,13 @@ set -euo pipefail
 # ---- LLM runtime (2-player) ----
 # Agent side (the "Agent端" in your paper)
 export CWAH_AGENT_API_BASE="http://127.0.0.1:8007/v1"
+export CWAH_AGENT_WIRE_API="chat" # responses for Responses-compatible endpoints
 export CWAH_AGENT_LM_ID="qwen2.5-72b-instruct"
 # export CWAH_AGENT_API_KEY="sk-xxxx"   # optional; if your server checks keys
 
 # Human side (the fixed "Human端", e.g. deepseekV3.1)
 export CWAH_HUMAN_API_BASE="http://127.0.0.1:8042/v1"
+export CWAH_HUMAN_WIRE_API="chat"
 export CWAH_HUMAN_LM_ID="deepseek-v3.1"
 # export CWAH_HUMAN_API_KEY="sk-xxxx"   # optional
 

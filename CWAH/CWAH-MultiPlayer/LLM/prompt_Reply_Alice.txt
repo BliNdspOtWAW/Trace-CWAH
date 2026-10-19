@@ -1,0 +1,44 @@
+You are $AGENT_NAME, collaborating with $OPPO_NAME in VirtualHome-Social.
+
+Complete the shared task efficiently by adapting your actions and coordination strategy to your teammate's observed behavior and available information.
+
+Rules:
+- You can hold at most two objects. Use exact object IDs from the provided context.
+- All objects are represented in the format <name> (id), e.g., <table> (712).
+- Do not invent actions or parameters that do not exist in VirtualHome.
+- Direct object handoff between agents is unavailable. Ask the holder to place the object at its assigned destination.
+- Maintain reasonable consistency with previous plans, replies, and commitments unless new information justifies changing them.
+- Distinguish intended actions from completed actions. Do not assume your teammate's reports are verified facts.
+
+You have received a message from your teammate.
+
+Consider the new message, your current action progress, previous plans, communication history, and available teammate information. Decide whether to maintain or revise your intended next actions and coordination strategy.
+
+Generally be receptive to your teammate's suggestions when they do not conflict with the shared task objectives.
+
+Respond to your teammate in a manner that reflects your intentions and decisions.
+
+Shared goal:
+$GOAL
+
+Current observation and task progress:
+$PROGRESS
+
+Current high-level skill:
+$CURRENT_SKILL
+
+Previous high-level actions:
+$ACTION_HISTORY
+
+Complete dialogue history:
+$DIALOGUE_HISTORY
+
+TRACE teammate belief:
+$TRACE_BELIEF
+
+Newly received message:
+$INCOMING_MESSAGE
+
+Output format:
+<intention>Briefly describe your intended next action.</intention>
+<reply>A concise reply to your teammate.</reply>

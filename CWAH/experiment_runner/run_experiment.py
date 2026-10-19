@@ -135,12 +135,18 @@ def validate(config):
         raw = config.get(f"{role}_prompt_file")
         if raw is not None and (not isinstance(raw, str) or not raw.strip()):
             raise ValueError(f"{role}_prompt_file must be a nonempty path")
-        prompt_path = _path(raw) if raw else GAME_ROOT / "LLM" / "prompt_Peer.txt"
+        prompt_path = _path(raw) if raw else GAME_ROOT / "LLM" / f"prompt_{role.title()}.txt"
         if not prompt_path.is_file() or not prompt_path.read_text(encoding="utf-8").strip():
             raise ValueError(f"{role} prompt missing or empty: {prompt_path}")
         prompt_files[role] = prompt_path
     if mode == "on" and "$TRACE_BELIEF" not in prompt_files["alice"].read_text(encoding="utf-8"):
         raise ValueError("TRACE-on Alice prompt must contain $TRACE_BELIEF")
+    for role in ('alice', 'bob'):
+        reply_path = GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt'
+        if not reply_path.is_file() or not reply_path.read_text(encoding='utf-8').strip():
+            raise ValueError(f'{role} reply prompt missing or empty: {reply_path}')
+        if role == 'alice' and mode == 'on' and '$TRACE_BELIEF' not in reply_path.read_text(encoding='utf-8'):
+            raise ValueError('TRACE-on Alice reply prompt must contain $TRACE_BELIEF')
     experiment_label = config.get("experiment_label")
     if experiment_label is not None:
         experiment_label = _label(experiment_label)
@@ -342,10 +348,27 @@ def _run_validated(config, selected, episode, index, port):
         "bob_profile_path": str(selected["profile_path"]) if selected["profile_path"] else None,
         "bob_profile_sha256": _sha256(selected["profile_path"]) if selected["profile_path"] else None,
         "trace_mode": selected["trace_mode"], "alice_model": config["alice_model"],
+        "api_protocol": {
+            role: child_env.get(prefix + '_WIRE_API', 'chat')
+            for role, prefix in [('alice', 'CWAH_AGENT'), ('bob', 'CWAH_HUMAN')]
+        },
+        "reasoning_effort": {
+            role: child_env.get(prefix + '_REASONING_EFFORT', 'high')
+            if child_env.get(prefix + '_WIRE_API', 'chat') == 'responses' else None
+            for role, prefix in [('alice', 'CWAH_AGENT'), ('bob', 'CWAH_HUMAN')]
+        },
         "continuous_subtasks": selected["continuous_subtasks"],
         "experiment_label": selected["experiment_label"],
         "planner_prompt_files": {role: str(path) for role, path in selected["prompt_files"].items()},
         "planner_prompt_sha256": {role: _sha256(path) for role, path in selected["prompt_files"].items()},
+        "reply_prompt_files": {
+            role: str(GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt')
+            for role in ('alice', 'bob')
+        },
+        "reply_prompt_sha256": {
+            role: _sha256(GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt')
+            for role in ('alice', 'bob')
+        },
         "bob_model": config["bob_model"], "temperature": config["temperature"],
         "max_tokens": config["max_tokens"], "max_episode_length": config["max_episode_length"],
         "num_runs": config["num_runs"], "port_request": selected["port_request"], "port": port,
@@ -357,8 +380,10 @@ def _run_validated(config, selected, episode, index, port):
         "code_commit": _git_revision(), "code_has_uncommitted_changes": _git_dirty(),
         "prompt_sha256": {
             name: _sha256(path) for name, path in {
-                "peer": GAME_ROOT / "LLM" / "prompt_Peer.txt",
-                "reply": GAME_ROOT / "LLM" / "prompt_Reply.txt",
+                "alice": selected['prompt_files']['alice'],
+                "bob": selected['prompt_files']['bob'],
+                "reply_alice": GAME_ROOT / "LLM" / "prompt_Reply_Alice.txt",
+                "reply_bob": GAME_ROOT / "LLM" / "prompt_Reply_Bob.txt",
                 "updater": GAME_ROOT / "trace_tf" / "prompt_Updater.txt",
                 "trace_policy": GAME_ROOT / "trace_tf" / "policy.py",
             }.items()

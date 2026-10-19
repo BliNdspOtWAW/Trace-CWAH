@@ -1,5 +1,29 @@
 # 手动运行 WAH + 独立队友画像实验
 
+当前默认角色模板为 Alice 的 `prompt_Alice.txt` 和 Bob 的 `prompt_Bob.txt`，
+而非旧的共用 Peer 模板；各自的 Reply 模板也已拆分。Continuous 目录当前提供
+Peer23/24、JD 模型的模板，其他画像见 `configs/config_lib/`。
+任务生成不会额外触发 TRACE；任务完成会作为合法 Evidence 记录。
+下文旧示例若提及 Peer17 或共用 Peer，应以实际 JSON 和运行时打印的 Prompt 为准。
+
+## API 配置入口（DS / JD）
+
+API 配置统一保存在本目录：`.env.ds` 和 `.env.jd`，均被 Git 忽略。
+可提交的空密钥模板是 `.env.ds.example` 和 `.env.jd.example`。
+DS 已从之前的本地设置迁移，之后不再读取 EntCollabBench 的 `.env`。
+
+```bash
+source CWAH/experiment_runner/env.sh ds
+# 或
+source CWAH/experiment_runner/env.sh jd
+```
+
+DS 使用 Chat Completions；JD 使用 Responses，密钥填写在 `.env.jd` 的
+`PROXY_OPENAI_API_KEY`。实验 JSON 中的 `alice_model` / `bob_model` 优先于
+env 的默认模型，切换供应商时也要选择匹配的实验 JSON。
+旧 `scripts/env.local.sh`（DS）和 `scripts/env.jd.sh`（JD）仍可使用，内部
+转到此统一入口；不要在 shell 开启 `set -x` 时加载密钥文件。
+
 这里的任务来自原始 WAH 候选数据，**不是 CollabBench 论文 Task 26 的严格复现**。任务与 Bob 画像分开选择：`episode_index` 选择 WAH Episode；`bob_profile.text_file` 直接读取画像文本，不根据 Task ID 做任何映射。Alice 不加载画像。`profiles/peer{8,17,23,24}.txt` 是从旧 CollabBench `26_prepare_food` 画像表复制的文本，供迁移实验使用；它们不是 WAH 原生画像。也可以换成自己的 UTF-8 文本文件，或把 `bob_profile` 设为 `null`（无画像）。
 
 ## 第一次配置
@@ -60,8 +84,8 @@ CWAH/experiments/trace/prepare_food_ep44_profilepeer17_trace-on_<时间>/
 在 `CWAH/experiment_runner/configs/` 下放多个 `*.json`。该目录中的本地 JSON 被 Git 忽略；仓库提供了两个 `.json.example` 样例。复制后按需修改 Episode、画像、模型和 `trace_mode`；**不需要手动分配端口**。同一 WAH 数据文件和 Unity 可执行文件可供多个实验读取和启动，不需要复制。示例：
 
 ```bash
-cp CWAH/experiment_runner/configs/prepare_food_ep44_peer17_off.json.example CWAH/experiment_runner/configs/peer17_off.json
-cp CWAH/experiment_runner/configs/prepare_food_ep44_peer17_on.json.example CWAH/experiment_runner/configs/peer17_on.json
+cp CWAH/experiment_runner/configs/config_lib/prepare_food_ep44_peer17_continuous_off.json.example CWAH/experiment_runner/configs/peer17_off.json
+cp CWAH/experiment_runner/configs/config_lib/prepare_food_ep44_peer17_continuous_on.json.example CWAH/experiment_runner/configs/peer17_on.json
 ```
 
 先在同一个 shell 中激活 conda 环境并加载 API 配置。批量预检与并行启动：
@@ -108,7 +132,8 @@ python CWAH/experiment_runner/run_many.py \
 
 ## Active 与 Reactive Planner
 
-正式实验统一使用当前 Peer Prompt。Active Planner 在需要新高层动作时运行，
+正式实验使用角色专属的 `prompt_Alice.txt` / `prompt_Bob.txt`，回复使用
+`prompt_Reply_Alice.txt` / `prompt_Reply_Bob.txt`。Active Planner 在需要新高层动作时运行，
 输出合法 Action；Reactive Planner 在收到主动消息后运行，强制输出内部
 `intention` 和实际 `reply`。`intention` 只保存在轨迹中，不发送给队友，也不
 替换当前 Runtime Skill。`reply` 进入双方完整 Dialogue History，供后续 Active

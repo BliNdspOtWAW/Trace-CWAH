@@ -6,9 +6,6 @@ from pathlib import Path
 from trace_tf.information import DecisionInformation
 
 
-REPLY_TEMPLATE = (Path(__file__).with_name("prompt_Reply.txt")).read_text(encoding="utf-8")
-
-
 def visible_object_summary(observation, limit=40):
     """Summarize only the recipient's partial observation, never the full scene."""
     nodes = observation.get("nodes", [])
@@ -40,6 +37,12 @@ def observed_self_state(observation, agent_id):
 class CommunicationModule:
     def __init__(self, planner):
         self.planner = planner
+        role = 'Alice' if getattr(planner, 'agent_name', 'Alice') == 'Alice' else 'Bob'
+        self.prompt_path = Path(getattr(
+            planner, 'reply_prompt_template_path',
+            Path(__file__).with_name(f'prompt_Reply_{role}.txt'),
+        ))
+        self.prompt_template = self.prompt_path.read_text(encoding='utf-8')
 
     def build_decision_information(
             self, incoming_message, dialogue_history, current_skill, observation,
@@ -71,7 +74,7 @@ class CommunicationModule:
     def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
               agent_id=None, progress="Unknown", action_history=(), belief_context="",
               decision_information=None):
-        prompt = REPLY_TEMPLATE
+        prompt = self.prompt_template
         information = decision_information or self.build_decision_information(
             incoming_message, dialogue_history, current_skill, observation,
             agent_id=agent_id, progress=progress, action_history=action_history,
@@ -109,6 +112,7 @@ class CommunicationModule:
         if not intention or not reply:
             raise ValueError("reactive planner must output non-empty <intention> and <reply>")
         return reply, {
+            "prompt_file": str(self.prompt_path),
             "model": self.planner.lm_id,
             "prompt": prompt,
             "raw_output": raw,

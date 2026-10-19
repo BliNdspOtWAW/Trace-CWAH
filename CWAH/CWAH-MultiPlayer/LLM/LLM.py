@@ -7,6 +7,7 @@ import pandas as pd
 from openai.error import OpenAIError
 import backoff
 from trace_tf.information import DecisionInformation
+from .responses_client import generate_responses
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
 df = pd.read_csv(csv_path)
@@ -60,14 +61,20 @@ class LLM:
         self.rooms = []
         role_prompt = getattr(sampling_parameters,
                               'alice_prompt_file' if agent_id == 1 else 'bob_prompt_file', None)
-        self.prompt_template_path = role_prompt or os.path.join(os.path.dirname(__file__), 'prompt_Peer.txt')
+        role_name = 'Alice' if agent_id == 1 else 'Bob'
+        self.prompt_template_path = role_prompt or os.path.join(
+            os.path.dirname(__file__), f'prompt_{role_name}.txt'
+        )
+        self.reply_prompt_template_path = os.path.join(
+            os.path.dirname(__file__), f'prompt_Reply_{role_name}.txt'
+        )
         self.single = False
         self.act = sampling_parameters.act
         self.big_5_act = sampling_parameters.big_5
         self.teammate_profile_file = getattr(sampling_parameters, 'teammate_profile_file', None)
         self.personality = None
 
-        # Both players default to the peer policy; only Bob receives a profile.
+        # Each player uses its role prompt; only Bob receives a profile.
         with open(self.prompt_template_path, 'r', encoding='utf-8') as f:
             self.prompt_template = f.read()
         self.prompt_template = self.prompt_template.replace("$AGENT_NAME", self.agent_name).replace("$OPPO_NAME", self.oppo_name)
@@ -96,6 +103,12 @@ class LLM:
         # 两个 agent 共用同一份 args；为了让 agent/human 能各用各的配置，这里让环境变量优先
         self.api_base = env_api_base or sampling_parameters.api_base
         self.api_key = env_api_key or getattr(sampling_parameters, "api_key", None)
+        self.wire_api = _get_env('WIRE_API') or 'chat'
+        if self.wire_api not in ('chat', 'responses'):
+            raise ValueError('WIRE_API must be chat or responses')
+        self.reasoning_effort = _get_env('REASONING_EFFORT') or 'high'
+        self.request_max_retries = int(_get_env('REQUEST_MAX_RETRIES') or '20')
+        self.responses_output_budget = int(_get_env('RESPONSES_OUTPUT_BUDGET') or '8192')
 
         # The configured backend selects the protocol. Model names are opaque
         # API identifiers, including gateway aliases and future model names.
@@ -162,6 +175,12 @@ class LLM:
             def _generate(prompt, sampling_params):
                 usage = 0
                 self.last_usage_metadata = None
+                if source == 'openai' and self.wire_api == 'responses':
+                    generated_samples, self.last_usage_metadata = generate_responses(
+                        self.api_base, self.api_key, self.lm_id, prompt, sampling_params,
+                        self.reasoning_effort, self.request_max_retries, self.responses_output_budget,
+                    )
+                    return generated_samples, 0
                 if source == 'openai':
                     try:
                         if self.chat:

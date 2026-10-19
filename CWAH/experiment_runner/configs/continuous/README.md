@@ -2,7 +2,7 @@
 
 Copy the supplied `.json.example` files to names ending in `.json` in this
 directory. Local JSON files are ignored by Git. This directory currently holds
-Peer8 TRACE on/off templates; additional Peer17 and Peer24 templates are
+Peer23 and Peer24 TRACE on/off templates (JD models); Peer8 and Peer17 templates are
 preserved in `../config_lib/`. The runner scans only `.json` files directly
 inside the selected directory. Check each configuration's model and step budget
 before running. All configurations use WAH Episode
