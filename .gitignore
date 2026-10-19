@@ -32,6 +32,7 @@ EntCollabBench/scripts/dataset/
 EntCollabBench/scripts/.env
 
 # CWAH / VirtualHome external and generated artifacts
+CWAH/runtime-logs/
 CWAH/virtualhome/
 CWAH/executable/
 CWAH/executable.zip
