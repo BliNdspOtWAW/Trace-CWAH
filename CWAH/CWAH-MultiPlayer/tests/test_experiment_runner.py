@@ -85,13 +85,17 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_official_configs_use_role_defaults_or_explicit_overrides(self):
         config_dir = Path(__file__).resolve().parents[2] / "experiment_runner" / "configs"
-        configs = [json.loads(path.read_text()) for path in sorted(config_dir.glob("*.json"))]
+        # Shipped templates exist on a clean clone; ignored local JSON does not.
+        configs = [json.loads(path.read_text()) for path in sorted(config_dir.rglob("*.json.example"))]
         self.assertTrue(configs)
         for config in configs:
-            selected = validate(config)
             for role in ('alice', 'bob'):
+                prompt_file = (run_experiment._path(config[f'{role}_prompt_file'])
+                               if config.get(f'{role}_prompt_file') else
+                               run_experiment.GAME_ROOT / 'LLM' / f'prompt_{role.title()}.txt')
                 expected = Path(config.get(f'{role}_prompt_file') or f'prompt_{role.title()}.txt').name
-                self.assertEqual(selected['prompt_files'][role].name, expected)
+                self.assertTrue(prompt_file.is_file())
+                self.assertEqual(prompt_file.name, expected)
 
     def test_trace_switch_controls_updater(self):
         room = {"id": 11, "class_name": "kitchen", "category": "Rooms"}
@@ -134,8 +138,7 @@ class ExperimentRunnerTests(unittest.TestCase):
         agent = LLM_agent.__new__(LLM_agent)
         agent.current_room = {"class_name": "kitchen"}
         agent.trace = trace
-        agent.satisfied = []
-        agent.unsatisfied = {"on_apple_table": 1}
+        agent.public_tasks = {}
         agent.last_action = "[walktowards] <apple> (12)"
         agent.plan = "[gograb] <apple> (12)"
         agent.action_history = [agent.plan]
@@ -163,7 +166,6 @@ class ExperimentRunnerTests(unittest.TestCase):
         agent.id_inside_room = {72: "kitchen"}
         agent.rooms_name = ["kitchen", "livingroom"]
         agent.goal_objects_name = ["apple", "kitchentable"]
-        agent.unsatisfied = {"on_apple_<kitchentable> (72)": 1}
         agent.plan = "[gograb] <apple> (10)"
         agent.action_history = [agent.plan]
         agent.dialogue_history = ["Bob: I found the apple."]
@@ -184,13 +186,14 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_completed_subtask_is_retained_separately_from_active_tasks(self):
         agent = LLM_agent.__new__(LLM_agent)
-        agent.completed_goals = []
+        agent.public_tasks = {}
         agent.trace = None
         completed = {
             "subtask_id": "s1", "object_id": 10, "object_class": "apple",
             "relation": "on", "target_id": 72, "target_class": "kitchentable",
-            "status": "completed", "completed_step": 4,
+            "status": "completed", "completed_step": 4, "completed_by": "Bob",
         }
+        agent.public_tasks = {'s1': completed}
 
         agent.record_task_completions([completed], {"s1": "Bob"}, step=4)
         agent.record_task_completions([completed], {"s1": "Bob"}, step=4)
@@ -222,24 +225,24 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertIn("already satisfied; do not repeat", planner.goal_desc)
         self.assertIn("<apple> (10) on <kitchentable> (72) by Bob", planner.goal_desc)
 
-    def test_completion_attribution_uses_only_alice_action_and_public_completion(self):
-        from algos.arena_mp2 import ArenaMP
+    def test_completion_attribution_is_owned_by_manager(self):
+        from envs.continuous_subtasks import ContinuousSubtaskManager
 
         task = {
             "subtask_id": "s1", "object_id": 10, "relation": "on",
             "target_id": 72,
         }
-        alice = ArenaMP._attribute_completed_subtasks(
-            [task], {0: "[putback] <apple> (10) <kitchentable> (72)",
+        alice = ContinuousSubtaskManager._completion_actor(
+            task, {0: "[putback] <apple> (10) <kitchentable> (72)",
                      1: "[walktowards] <bedroom> (210)"},
         )
-        bob = ArenaMP._attribute_completed_subtasks(
-            [task], {0: "[walktowards] <bedroom> (210)",
-                     1: "PRIVATE_BOB_ACTION_IS_NOT_NEEDED"},
+        bob = ContinuousSubtaskManager._completion_actor(
+            task, {0: "[walktowards] <bedroom> (210)",
+                     1: "[putback] <apple> (10) <kitchentable> (72)"},
         )
 
-        self.assertEqual(alice["s1"], "Alice")
-        self.assertEqual(bob["s1"], "Bob")
+        self.assertEqual(alice, "Alice")
+        self.assertEqual(bob, "Bob")
 
     def test_continuous_exact_inside_goal_produces_putin(self):
         agent = LLM_agent.__new__(LLM_agent)
@@ -253,11 +256,11 @@ class ExperimentRunnerTests(unittest.TestCase):
         }
         agent.id_inside_room = {103: "kitchen"}
         agent.reachable_objects = ["<fridge> (103)"]
-        agent.active_goals = [{
-            "predicate": "inside_10_103", "relation": "inside",
-            "object_token": "10", "target_id": 103, "count": 1,
+        agent.public_tasks = {'S1': {
+            "status": "active", "relation": "inside",
+            "object_id": 10, "target_id": 103, "count": 1,
             "object_class": "apple", "target_class": "fridge",
-        }]
+        }}
         agent.plan = "[goput] <apple> (10) <fridge> (103)"
 
         self.assertEqual(agent._put_options(), [agent.plan])

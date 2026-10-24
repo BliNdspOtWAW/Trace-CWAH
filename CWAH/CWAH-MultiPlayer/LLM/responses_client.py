@@ -9,11 +9,16 @@ def generate_responses(base_url, api_key, model, messages, params, effort='high'
         raise ValueError('Responses API key is empty; fill PROXY_OPENAI_API_KEY first')
     outputs = []
     totals = dict(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+    totals.update(cached_input_tokens=None, reasoning_tokens=None, request_count=0,
+                  retry_count=0, token_usage_available=True)
     for _ in range(params.get('n', 1)):
         body = {'model': model, 'input': messages, 'store': False,
                 'max_output_tokens': max(output_budget, params.get('max_tokens', 1024)),
                 'reasoning': {'effort': effort}}
         for attempt in range(max_retries + 1):
+            totals['request_count'] += 1
+            if attempt:
+                totals['retry_count'] += 1
             try:
                 response = requests.post(
                     base_url.rstrip('/') + '/responses', json=body,
@@ -40,6 +45,13 @@ def generate_responses(base_url, api_key, model, messages, params, effort='high'
             raise RuntimeError('Responses returned no complete assistant text (status={})'.format(data.get('status')))
         outputs.append(text)
         usage = data.get('usage') or {}
+        if not all(isinstance(usage.get(key), int) for key in ('input_tokens', 'output_tokens', 'total_tokens')):
+            totals['token_usage_available'] = False
+        for target, detail in [('cached_input_tokens', 'input_tokens_details'),
+                               ('reasoning_tokens', 'output_tokens_details')]:
+            value = (usage.get(detail) or {}).get('cached_tokens' if target == 'cached_input_tokens' else 'reasoning_tokens')
+            if isinstance(value, int):
+                totals[target] = (totals[target] or 0) + value
         for target, source in [('prompt_tokens', 'input_tokens'),
                                ('completion_tokens', 'output_tokens'), ('total_tokens', 'total_tokens')]:
             totals[target] += usage.get(source) or 0

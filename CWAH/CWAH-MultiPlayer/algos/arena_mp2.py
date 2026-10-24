@@ -66,10 +66,10 @@ class ArenaMP(object):
             else:
                 agent.reset(self.env.full_graph)
         if getattr(self.env, 'continuous_subtasks_enabled', False):
-            records = self.env.continuous_subtasks.active_subtasks()
+            records = self.env.continuous_subtasks.public_snapshot()
             for it, agent in enumerate(self.agents):
                 if 'LLM' in agent.agent_type:
-                    agent.update_task_goal(self.env.goal_spec[it], records)
+                    agent.set_public_tasks(records)
 
     def set_weigths(self, epsilon, weights):
         for agent in self.agents:
@@ -121,9 +121,9 @@ class ArenaMP(object):
 
             elif 'LLM' in agent.agent_type:
                 if getattr(self.env, 'continuous_subtasks_enabled', False):
-                    agent.update_task_goal(
-                        goal_spec, self.env.continuous_subtasks.active_subtasks()
-                    )
+                    agent.set_public_tasks(self.env.continuous_subtasks.public_snapshot())
+                else:
+                    agent.update_task_goal(goal_spec)
                 dict_actions[it], dict_info[it] = agent.get_action(obs[it], goal_spec)
 
         return dict_actions, dict_info
@@ -382,6 +382,8 @@ class ArenaMP(object):
             pass
             #self.env.changed_graph = True
         obs = self.env.get_observations()
+        step_snapshot = copy.deepcopy(obs)
+        decision_step = self.env.steps
         action_space = self.env.get_action_space()
         dict_actions, dict_info = self.get_actions(obs, action_space, true_graph=true_graph)
         for i in range(len(dict_info)):
@@ -390,53 +392,37 @@ class ArenaMP(object):
                 self.cnt_nouse_subgoal += dup
                 if i == 0 and 'subgoals' in dict_info[i + 1].keys() and dict_info[i]['subgoals'] == dict_info[i + 1]['subgoals']:
                     self.cnt_duplicate_subgoal += 1
+        # Barrier: both agents have selected their actions before either hears
+        # this step's active message. Replies use O(t), never O(t+1).
+        messages = [None for _ in self.agents]
+        for index, action in dict_actions.items():
+            if isinstance(action, str) and action.startswith('[send_message]'):
+                start, end = action.find('<'), action.rfind('>')
+                messages[index] = action[start + 1:end][:500] if start >= 0 and end > start else ''
+        frozen_actions = copy.deepcopy(dict_actions)
+        self.last_communication_events = self.process_messages(
+            messages, observations=step_snapshot, step=decision_step)
+        for index, agent in enumerate(self.agents):
+            if hasattr(agent, 'control_context'):
+                dict_info.setdefault(index, {})['agent_control_after_reactive'] = agent.control_context()
         try:
-            step_info = self.env.step(dict_actions)
+            step_info = self.env.step(frozen_actions)
         except Exception as e:
             print("Exception occurs when performing action: ", dict_actions)
             raise Exception
         continuous_event = step_info[3].get('continuous_subtasks', {})
         completed = continuous_event.get('completed', [])
         if completed:
-            attribution = self._attribute_completed_subtasks(completed, dict_actions)
             for agent in self.agents:
                 if hasattr(agent, 'record_task_completions'):
-                    agent.record_task_completions(completed, attribution, self.env.steps)
-        post_step_observations = self.env.get_observations()
-        if self.agents and hasattr(self.agents[0], "observe_trace_outcome"):
-            self.agents[0].observe_trace_outcome(post_step_observations[0], self.env.steps)
-        self.last_communication_events = self.process_messages(
-            step_info[4], step_info[2], observations=post_step_observations
-        )
-        return step_info, dict_actions, dict_info
+                    agent.record_task_completions(completed, step=self.env.steps)
+        return step_info, frozen_actions, dict_info
 
-    @staticmethod
-    def _attribute_completed_subtasks(completed, actions):
-        """Use public completion plus Alice's own action; never expose Bob's action."""
-        result = {}
-        for task in completed:
-            expected = 'putin' if task.get('relation') == 'inside' else 'putback'
-            own_action = actions.get(0)
-            ids = ([int(value) for value in re.findall(r'\((\d+)\)', own_action)]
-                   if isinstance(own_action, str) else [])
-            done_by_alice = (
-                isinstance(own_action, str)
-                and own_action.startswith('[' + expected + ']')
-                and len(ids) >= 2
-                and ids[0] == task.get('object_id')
-                and ids[-1] == task.get('target_id')
-            )
-            # Continuous C-WAH has exactly Alice and Bob and no exogenous task
-            # executor. A newly completed public task not caused by Alice is
-            # therefore attributable to Bob by exclusion.
-            result[task.get('subtask_id')] = 'Alice' if done_by_alice else 'Bob'
-        return result
-
-    def process_messages(self, messages, done=False, observations=None):
+    def process_messages(self, messages, done=False, observations=None, step=None):
         """Deliver active messages and at most one free reply per active message."""
         events = []
         active = []
-        step = self.env.steps - 1
+        step = self.env.steps if step is None else step
         for sender, message in enumerate(messages):
             if message is None or not message.strip():
                 continue
@@ -462,11 +448,16 @@ class ArenaMP(object):
             try:
                 reply, call = agent.reply_to_message(parent["text"], observations[receiver])
             except Exception as exc:
-                events.append({
+                event = {
                     "step": step, "kind": "reply_error", "sender": receiver,
                     "receiver": parent["sender"], "parent_sender": parent["sender"],
                     "error": f"{type(exc).__name__}: {exc}",
-                })
+                }
+                # Diagnostics stay in the experiment trajectory, not dialogue
+                # or legal evidence, and do not turn invalid output into a reply.
+                if isinstance(getattr(exc, 'call', None), dict):
+                    event['call'] = exc.call
+                events.append(event)
                 continue
             events.append({
                 "step": step, "kind": "reply_call", "sender": receiver,
@@ -503,6 +494,10 @@ class ArenaMP(object):
     def _save_checkpoint(self, saved_info):
         """Atomically preserve the last fully recorded step, including TRACE."""
         snapshot = dict(saved_info)
+        repeat = os.environ.get('CWAH_METRICS_REPEAT', '0')
+        snapshot['run_index'] = int(repeat) if repeat.isdigit() else 0
+        if os.environ.get('CWAH_METRICS_EPISODE', '').isdigit():
+            snapshot['episode_index'] = int(os.environ['CWAH_METRICS_EPISODE'])
         snapshot['environment_steps'] = len(saved_info['action'].get(0, []))
         if self.agents and getattr(self.agents[0], 'trace', None) is not None:
             trace = self.agents[0].trace
@@ -564,6 +559,7 @@ class ArenaMP(object):
                           'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0
                       },
                       'continuous_subtask_events': [],
+                      'agent_control': {0: [], 1: []},
                       'termination_reason': None,
                       
                     }
@@ -594,6 +590,11 @@ class ArenaMP(object):
             if 'progress' in infos:
                 saved_info['progress'].append(infos['progress'])
             for agent_id, info in agent_info.items():
+                saved_info['agent_control'][agent_id].append({
+                    'step': self.env.steps - 1,
+                    'before_reactive': copy.deepcopy(info.get('agent_control')),
+                    'after_reactive': copy.deepcopy(info.get('agent_control_after_reactive')),
+                })
                 if 'belief_graph' in info:
                     saved_info['belief_graph'][agent_id].append(info['belief_graph'])
                 if 'belief' in info:

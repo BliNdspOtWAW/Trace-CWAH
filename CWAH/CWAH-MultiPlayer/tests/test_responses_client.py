@@ -5,6 +5,27 @@ from LLM.responses_client import generate_responses
 
 
 class ResponsesTests(unittest.TestCase):
+    @patch('LLM.responses_client.time.sleep')
+    @patch('LLM.responses_client.requests.post')
+    def test_detailed_usage_and_retry_metrics(self, post, sleep):
+        success = Mock(status_code=200)
+        success.json.return_value = {
+            'status': 'completed',
+            'output': [{'type': 'message', 'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': 'OK'}]}],
+            'usage': {'input_tokens': 10, 'output_tokens': 20, 'total_tokens': 30,
+                      'input_tokens_details': {'cached_tokens': 3},
+                      'output_tokens_details': {'reasoning_tokens': 7}},
+        }
+        post.side_effect = [Mock(status_code=429), success]
+        result, usage = generate_responses('https://example.invalid', 'test', 'test', [], {}, max_retries=1)
+        self.assertEqual(usage['retry_count'], 1)
+        self.assertEqual(usage['request_count'], 2)
+        self.assertEqual(usage['cached_input_tokens'], 3)
+        self.assertEqual(usage['reasoning_tokens'], 7)
+        self.assertTrue(usage['token_usage_available'])
+        self.assertEqual(result, ['OK'])
+
     @patch('LLM.responses_client.requests.post')
     def test_responses_mapping_and_usage(self, post):
         post.return_value = Mock(status_code=200)

@@ -27,6 +27,16 @@ $GOAL
 Current progress:
 $PROGRESS
 
+Public task snapshot (authoritative; completed tasks are history, not current goals):
+$PUBLIC_TASKS
+
+Your execution control:
+$AGENT_CONTROL
+current_subtask_id is your macro objective. current_skill may still serve skill_subtask_id
+while finishing an earlier skill after a negotiated target change. Actions in history
+are selections, not proof of execution. Prefer a skill serving your current active
+subtask; revise the macro objective when appropriate. Do not repeat completed tasks.
+
 Complete dialogue history:
 $DIALOGUE_HISTORY
 
@@ -40,6 +50,9 @@ Available high-level actions:
 $ACTIONS_REFINE
 
 Select exactly one available action, either a physical action or [send_message]. You cannot perform both in the same step.
+Also output <subtask_id> with one active public task ID. Use null only for general
+exploration or communication without a task-specific objective. Grab/put actions
+must match that subtask's object and destination. Always close </subtask_id>.
 
 If you select a physical action, leave <message> empty.
 If you select [send_message], provide a concise message and output [send_message] as the action.
@@ -48,8 +61,10 @@ Output format (physical action):
 <cot>Brief task-grounded reason for the chosen action.</cot>
 <message></message>
 <action>Exactly one available physical action.</action>
+<subtask_id>An active task ID, or null for task-independent communication/exploration.</subtask_id>
 
 Output format ([send_message]):
 <cot>Brief task-grounded reason for the chosen action.</cot>
 <message>A concise message to your teammate.</message>
 <action>[send_message]</action>
+<subtask_id>An active task ID, or null for task-independent communication/exploration.</subtask_id>

@@ -122,8 +122,8 @@ class ContinuousSubtaskTests(unittest.TestCase):
         manager.advance(self.graph, step=5)
 
         self.assertEqual(manager.cooldowns[10]["blocked_target_id"], 268)
-        manager.active = {
-            key: value for key, value in manager.active.items()
+        manager.subtasks = {
+            key: value for key, value in manager.subtasks.items()
             if value["object_id"] != 10
         }
         valid, reason = manager._valid_candidate(

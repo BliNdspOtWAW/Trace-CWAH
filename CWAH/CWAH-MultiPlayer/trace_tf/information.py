@@ -18,6 +18,8 @@ class DecisionInformation:
     source_event_ids: tuple = field(default_factory=tuple)
     current_skill: str = None
     incoming_message: str = None
+    public_tasks: dict = field(default_factory=dict)
+    agent_control: dict = field(default_factory=dict)
 
     def to_dict(self):
         return copy.deepcopy({
@@ -32,4 +34,6 @@ class DecisionInformation:
             "source_event_ids": list(self.source_event_ids),
             "current_skill": self.current_skill,
             "incoming_message": self.incoming_message,
+            "public_tasks": self.public_tasks,
+            "agent_control": self.agent_control,
         })

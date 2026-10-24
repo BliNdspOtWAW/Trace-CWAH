@@ -2,8 +2,19 @@
 
 import re
 import time
+import json
+import copy
 from pathlib import Path
 from trace_tf.information import DecisionInformation
+from .telemetry import measured_generate
+
+
+class ReplyFormatError(ValueError):
+    """A failed parse with diagnostics, never an alternative executable reply."""
+
+    def __init__(self, call):
+        super().__init__("reactive planner must output non-empty <intention> and <reply>")
+        self.call = call
 
 
 def visible_object_summary(observation, limit=40):
@@ -47,7 +58,7 @@ class CommunicationModule:
     def build_decision_information(
             self, incoming_message, dialogue_history, current_skill, observation,
             agent_id=None, progress="Unknown", action_history=(), step=0,
-            source_event_ids=()):
+            source_event_ids=(), public_tasks=None, agent_control=None):
         observed_room, holding = observed_self_state(
             observation, agent_id if agent_id is not None else getattr(self.planner, "agent_id", None)
         )
@@ -69,6 +80,8 @@ class CommunicationModule:
             source_event_ids=tuple(source_event_ids),
             current_skill=current_skill or "None",
             incoming_message=incoming_message,
+            public_tasks=copy.deepcopy(public_tasks or {}),
+            agent_control=copy.deepcopy(agent_control or {}),
         )
 
     def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
@@ -90,6 +103,8 @@ class CommunicationModule:
             "$DIALOGUE_HISTORY": "\n".join(information.dialogue_history) or "None",
             "$TRACE_BELIEF": belief_context or "TRACE is disabled. No teammate belief is available.",
             "$INCOMING_MESSAGE": incoming_message,
+            "$PUBLIC_TASKS": json.dumps(information.public_tasks, ensure_ascii=False),
+            "$AGENT_CONTROL": json.dumps(information.agent_control, ensure_ascii=False),
         }
         for placeholder, value in values.items():
             prompt = prompt.replace(placeholder, str(value))
@@ -102,24 +117,41 @@ class CommunicationModule:
         else:
             params["max_new_tokens"] = min(params.get("max_new_tokens", 256), 256)
         started = time.monotonic()
-        outputs, legacy_cost = self.planner.generator(request, params)
+        outputs, legacy_cost = measured_generate(
+            self.planner, request, params, 'reactive', information,
+            sections={
+                'goal': values['$GOAL'], 'progress': values['$PROGRESS'],
+                'current_skill': values['$CURRENT_SKILL'],
+                'action_history': values['$ACTION_HISTORY'],
+                'dialogue_history': values['$DIALOGUE_HISTORY'],
+                'trace_belief': values['$TRACE_BELIEF'], 'incoming_message': incoming_message,
+            })
         elapsed = time.monotonic() - started
         raw = outputs[0] if outputs else ""
         intention_match = re.search(r"<intention>\s*(.*?)\s*</intention>", raw, re.I | re.S)
         reply_match = re.search(r"<reply>\s*(.*?)\s*</reply>", raw, re.I | re.S)
         intention = intention_match.group(1).strip()[:500] if intention_match else ""
         reply = reply_match.group(1).strip()[:500] if reply_match else ""
-        if not intention or not reply:
-            raise ValueError("reactive planner must output non-empty <intention> and <reply>")
-        return reply, {
+        task_match = re.search(r'<new_subtask_id>\s*(.*?)\s*</new_subtask_id>', raw, re.I | re.S)
+        task_id = task_match.group(1).strip() if task_match else None
+        call = {
             "prompt_file": str(self.prompt_path),
             "model": self.planner.lm_id,
             "prompt": prompt,
             "raw_output": raw,
             "intention": intention,
             "reply": reply,
+            "new_subtask_id": None if task_id in (None, '', 'null', 'None') else task_id,
             "usage": self.planner.last_usage_metadata,
             "legacy_cost_estimate": legacy_cost,
             "latency_seconds": elapsed,
             "shared_information": information.to_dict(),
+            "metrics_call_id": getattr(self.planner, 'last_call_metrics', {}).get('call_id'),
+            "parse_status": "ok" if intention and reply else "error",
+            "parse_error": None if intention and reply else "missing_or_empty_intention_or_reply",
         }
+        if not intention or not reply or (information.public_tasks and (task_match is None or not task_id)):
+            call['parse_status'] = 'error'
+            call['parse_error'] = 'missing_or_empty_required_reactive_fields'
+            raise ReplyFormatError(call)
+        return reply, call

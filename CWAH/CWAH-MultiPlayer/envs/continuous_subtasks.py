@@ -7,6 +7,7 @@ object instances and are exposed through the native WAH predicate format.
 
 import copy
 import random
+import re
 
 
 SUPPORTED_RELATIONS = {"on", "inside"}
@@ -61,12 +62,10 @@ class ContinuousSubtaskManager:
         self.targets = copy.deepcopy(targets or [])
         self.max_generation_attempts = max_generation_attempts
         self.reverse_cooldown_steps = reverse_cooldown_steps
-        self.active = {}
+        self.subtasks = {}
         self.next_subtask_number = 1
         self.revision = 0
-        self.completed_count = 0
         self.events = []
-        self.completed_subtasks = []
         self.cooldowns = {}
         self.generation_failures = 0
         self.last_generation_attempts = 0
@@ -76,6 +75,23 @@ class ContinuousSubtaskManager:
         return "{}_{}_{}".format(
             record["relation"], record["object_id"], record["target_id"]
         )
+
+    @property
+    def active(self):
+        return {key: value for key, value in self.subtasks.items() if value['status'] == 'active'}
+
+    @property
+    def completed_subtasks(self):
+        return [copy.deepcopy(value) for value in self.subtasks.values() if value['status'] == 'completed']
+
+    @property
+    def completed_count(self):
+        return len(self.completed_subtasks)
+
+    def public_snapshot(self):
+        """Detached public truth; no agent assignment or private plans."""
+        return {key: {name: copy.deepcopy(value) for name, value in task.items()
+                      if name != 'source_target_id'} for key, task in self.subtasks.items()}
 
     def task_goal(self):
         """Expose active concrete tasks in the native WAH goal dictionary."""
@@ -124,6 +140,8 @@ class ContinuousSubtaskManager:
             "target_class": target_class,
             "status": "active",
             "created_step": step,
+            "completed_step": None,
+            "completed_by": None,
             "source_target_id": source_target_id,
         }
 
@@ -240,7 +258,7 @@ class ContinuousSubtaskManager:
             if record is None:
                 self.generation_failures += 1
                 break
-            self.active[record["subtask_id"]] = record
+            self.subtasks[record["subtask_id"]] = record
             generated.append(copy.deepcopy(record))
         self.last_generation_attempts = attempts
         return generated, attempts, rejected
@@ -249,32 +267,29 @@ class ContinuousSubtaskManager:
         self._validate_targets(graph)
         initial = self._initial_records(graph, step)
         for record in initial:
-            self.active[record["subtask_id"]] = record
+            self.subtasks[record["subtask_id"]] = record
         generated, attempts, rejected = self._fill(graph, step)
         self.revision += 1
         event = self._event(step, [], initial + generated, attempts, rejected)
         self.events.append(event)
         return copy.deepcopy(event)
 
-    def advance(self, graph, step):
+    def advance(self, graph, step, actions=None):
         completed = []
         for subtask_id, record in list(self.active.items()):
             if not _relation_holds(
                 graph, record["relation"], record["object_id"], record["target_id"]
             ):
                 continue
-            item = copy.deepcopy(record)
-            item["status"] = "completed"
-            item["completed_step"] = step
-            completed.append(item)
-            self.completed_subtasks.append(copy.deepcopy(item))
-            del self.active[subtask_id]
+            record['status'] = 'completed'
+            record['completed_step'] = step
+            record['completed_by'] = self._completion_actor(record, actions or {})
+            completed.append(copy.deepcopy(record))
             if record["source_target_id"] is not None and self.reverse_cooldown_steps:
                 self.cooldowns[record["object_id"]] = {
                     "blocked_target_id": record["source_target_id"],
                     "until_step": step + self.reverse_cooldown_steps,
                 }
-        self.completed_count += len(completed)
         generated, attempts, rejected = self._fill(graph, step)
         changed = bool(completed or generated or attempts)
         if changed:
@@ -283,6 +298,18 @@ class ContinuousSubtaskManager:
         if changed:
             self.events.append(event)
         return copy.deepcopy(event)
+
+    @staticmethod
+    def _completion_actor(record, actions):
+        expected = 'putin' if record['relation'] == 'inside' else 'putback'
+        matches = []
+        for index, action in actions.items():
+            if not isinstance(action, str) or not action.startswith('[' + expected + ']'):
+                continue
+            ids = [int(value) for value in re.findall(r'\((\d+)\)', action)]
+            if len(ids) == 2 and ids == [record['object_id'], record['target_id']]:
+                matches.append(index)
+        return {0: 'Alice', 1: 'Bob'}.get(matches[0], 'unknown') if len(matches) == 1 else 'unknown'
 
     def _event(self, step, completed, generated, attempts, rejected):
         shortfall = max(0, self.active_count - len(self.active))
@@ -295,6 +322,7 @@ class ContinuousSubtaskManager:
             "rejection_counts": copy.deepcopy(rejected),
             "active_goal": copy.deepcopy(self.task_goal()),
             "active_subtasks": self.active_subtasks(),
+            "subtasks": self.public_snapshot(),
             "active_predicates": len(self.active),
             "target_active_predicates": self.active_count,
             "cumulative_completed": self.completed_count,
@@ -312,4 +340,5 @@ class ContinuousSubtaskManager:
             "generation_failures": self.generation_failures,
             "candidate_exhausted": False,
             "events": copy.deepcopy(self.events),
+            "subtasks": self.public_snapshot(),
         }

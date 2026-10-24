@@ -94,6 +94,7 @@ if __name__ == '__main__':
         test_episodes = episode_ids
     start_time = time.time()
     for iter_id in range(num_tries):
+        os.environ['CWAH_METRICS_REPEAT'] = str(iter_id)
         steps_list, failed_tasks = [], []
         if not os.path.isfile(args.record_dir + '/results.pik'):
             test_results = {}
@@ -103,6 +104,7 @@ if __name__ == '__main__':
         current_tried = iter_id
 
         for episode_id in test_episodes:
+            os.environ['CWAH_METRICS_EPISODE'] = str(episode_id)
             curr_log_file_name = args.record_dir + '/logs_agent_{}_{}_{}.pik'.format(
                 env_task_set[episode_id]['task_id'],
                 env_task_set[episode_id]['task_name'],
@@ -133,6 +135,9 @@ if __name__ == '__main__':
             arena.reset(episode_id, task)
             
             success, steps, saved_info = arena.run()
+            saved_info['run_index'] = iter_id
+            saved_info['episode_index'] = episode_id
+            saved_info['environment_steps'] = steps
             print('-------------------------------------')
             print('success' if success else 'failure')
             print('steps:', steps)

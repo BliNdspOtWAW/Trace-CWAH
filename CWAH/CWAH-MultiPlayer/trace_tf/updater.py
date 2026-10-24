@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .events import EvidenceLedger
 from .model import BeliefState, Evidence, EvidenceSource
+from LLM.telemetry import measured_generate
 
 
 PROMPT = Path(__file__).with_name("prompt_Updater.txt").read_text(encoding="utf-8")
@@ -115,9 +116,12 @@ class HybridUpdater:
             'Do not evaluate Preference this call. Omit preference and '
             'uncertainty.preference; the runtime retains both previous values.'
         )
-        prompt = PROMPT.replace("$INFORMATION", json.dumps(information, ensure_ascii=False))
-        prompt = prompt.replace("$BELIEF", json.dumps(self._compact_prior(), ensure_ascii=False))
-        prompt = prompt.replace("$EVENTS", json.dumps(self._prompt_events(selected), ensure_ascii=False))
+        information_json = json.dumps(information, ensure_ascii=False)
+        prior_json = json.dumps(self._compact_prior(), ensure_ascii=False)
+        events_json = json.dumps(self._prompt_events(selected), ensure_ascii=False)
+        prompt = PROMPT.replace("$INFORMATION", information_json)
+        prompt = prompt.replace("$BELIEF", prior_json)
+        prompt = prompt.replace("$EVENTS", events_json)
         prompt = prompt.replace("$PREFERENCE_ASSESSMENT", preference_instruction)
         sampling = self.planner.sampling_params
         params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
@@ -127,7 +131,15 @@ class HybridUpdater:
         params[limit_key] = min(params.get(limit_key, 768), 768)
         request = [{"role": "user", "content": prompt}] if self.planner.chat else prompt
         started = time.monotonic()
-        outputs, legacy_cost = self.planner.generator(request, params)
+        outputs, legacy_cost = measured_generate(
+            self.planner, request, params, 'updater', information,
+            sections={'information': information_json, 'prior_belief': prior_json,
+                      'events': events_json, 'preference_assessment': preference_instruction,
+                      'dialogue_history': information.get('dialogue_history', []),
+                      'action_history': information.get('action_history', [])},
+            counts={'ledger_events': len(self.ledger.events), 'selected_events': len(selected),
+                    'preference_events': len(preference_events),
+                    'preference_due': int(self.preference_due)})
         latency = time.monotonic() - started
         raw = outputs[0] if outputs else ""
         match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.I | re.S)

@@ -3,11 +3,13 @@ import openai
 import torch
 import json
 import os
+import copy
 import pandas as pd
 from openai.error import OpenAIError
 import backoff
 from trace_tf.information import DecisionInformation
 from .responses_client import generate_responses
+from .telemetry import measured_generate
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
 df = pd.read_csv(csv_path)
@@ -65,7 +67,9 @@ class LLM:
         self.prompt_template_path = role_prompt or os.path.join(
             os.path.dirname(__file__), f'prompt_{role_name}.txt'
         )
-        self.reply_prompt_template_path = os.path.join(
+        self.reply_prompt_template_path = os.getenv(
+            'CWAH_AGENT_REPLY_PROMPT_FILE' if agent_id == 1 else 'CWAH_HUMAN_REPLY_PROMPT_FILE'
+        ) or os.path.join(
             os.path.dirname(__file__), f'prompt_Reply_{role_name}.txt'
         )
         self.single = False
@@ -112,7 +116,7 @@ class LLM:
 
         # The configured backend selects the protocol. Model names are opaque
         # API identifiers, including gateway aliases and future model names.
-        self.chat = self.source == 'openai'
+        self.chat = self.source in ('openai', 'huggingface')
         self.OPENAI_KEY = None
         self.total_cost = 0
         self.last_usage_metadata = None
@@ -145,14 +149,10 @@ class LLM:
                 }
         elif self.source == 'huggingface':
             self.sampling_params = {
-                "max_new_tokens": sampling_parameters.max_tokens,
+                "max_tokens": sampling_parameters.max_tokens,
                 "temperature": sampling_parameters.t,
                 "top_p": sampling_parameters.top_p,
-                "num_return_sequences": sampling_parameters.n,
-                'use_cache': True,
-                'return_dict_in_generate': True,
-                'do_sample': True,
-                'early_stopping': True,
+                "n": sampling_parameters.n,
             }
         elif self.source == "debug":
             self.sampling_params = sampling_parameters
@@ -161,15 +161,8 @@ class LLM:
 
         def lm_engine(source, lm_id, device):
             if source == 'huggingface':
-                from transformers import AutoModelForCausalLM, AutoTokenizer, LLaMATokenizer, LLaMAForCausalLM
-                print(f"loading huggingface model {lm_id}")
-                if 'llama' in lm_id or 'alpaca' in lm_id:
-                    tokenizer = LLaMATokenizer.from_pretrained(lm_id)
-                    model = LLaMAForCausalLM.from_pretrained(lm_id, torch_dtype=torch.float16, low_cpu_mem_usage=True, load_in_8bit=False).to(device)
-                else:
-                    tokenizer = AutoTokenizer.from_pretrained(lm_id)
-                    model = AutoModelForCausalLM.from_pretrained(lm_id, torch_dtype=torch.float16, pad_token_id=tokenizer.eos_token_id).to(device)
-                print(f"loaded huggingface model {lm_id}")
+                from .local_backend import get_backend
+                backend = get_backend(lm_id, json.loads(os.getenv('CWAH_LOCAL_MODEL_OPTIONS', '{}')))
 
             @backoff.on_exception(backoff.expo, OpenAIError)
             def _generate(prompt, sampling_params):
@@ -198,6 +191,10 @@ class LLM:
                                 key: response_usage.get(key)
                                 for key in ('prompt_tokens', 'completion_tokens', 'total_tokens')
                             }
+                            self.last_usage_metadata.update({
+                                'cached_input_tokens': (response_usage.get('prompt_tokens_details') or {}).get('cached_tokens'),
+                                'reasoning_tokens': (response_usage.get('completion_tokens_details') or {}).get('reasoning_tokens'),
+                            })
                             if 'gpt-4' in self.lm_id:
                                 usage = response['usage']['prompt_tokens'] * 0.03 / 1000 + response['usage']['completion_tokens'] * 0.06 / 1000
                             elif 'gpt-3.5' in self.lm_id:
@@ -211,13 +208,7 @@ class LLM:
                         print(e)
                         raise e
                 elif source == 'huggingface':
-                    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-                    prompt_len = input_ids.shape[-1]
-                    output_dict = model.generate(input_ids, **sampling_params)
-                    generated_samples = tokenizer.batch_decode(output_dict.sequences[:, prompt_len:])
-                    for i, sample in enumerate(generated_samples):
-                        stop_idx = sample.index('\n') if '\n' in sample else None
-                        generated_samples[i] = sample[:stop_idx]
+                    generated_samples, self.last_usage_metadata = backend.generate(prompt, sampling_params)
                 elif source == "debug":
                     return ["navigation"], 0
                 else:
@@ -286,6 +277,7 @@ class LLM:
         records = {
             f"{item['relation']}_{item['object_id']}_{item['target_id']}": item
             for item in self.active_subtasks
+            if item.get('object_id') is not None
         }
         descriptions = []
         for predicate, vl in goals.items():
@@ -611,6 +603,8 @@ class LLM:
         prompt = prompt.replace('$ASSIGNED_PERSONALITY', information.personality)
         prompt = prompt.replace('$DIALOGUE_HISTORY', dialogue_history_desc)
         prompt = prompt.replace('$TRACE_BELIEF', belief_context)
+        prompt = prompt.replace('$PUBLIC_TASKS', json.dumps(information.public_tasks, ensure_ascii=False))
+        prompt = prompt.replace('$AGENT_CONTROL', json.dumps(information.agent_control, ensure_ascii=False))
         available_plans_list = list(information.available_actions_with_distance)
         available_plans_list_refine = list(information.available_actions)
         available_plans_refine = ''.join(
@@ -631,13 +625,27 @@ class LLM:
         info["raw_prompt"] = prompt
         info["trace_belief_context"] = belief_context
         info["raw_chat_prompt"] = chat_prompt
-        outputs, usage = self.generator(chat_prompt if self.chat else prompt, self.sampling_params)
+        outputs, usage = measured_generate(
+            self, chat_prompt if self.chat else prompt, self.sampling_params,
+            'active', information, sections={
+                'goal': information.goal, 'progress': progress_desc,
+                'action_history': action_history_desc, 'dialogue_history': dialogue_history_desc,
+                'available_actions': available_plans_refine, 'trace_belief': belief_context,
+            })
         output = outputs[0]
+        import re
+        subtask_match = re.search(r'<subtask_id>\s*(.*?)\s*</subtask_id>', output, re.I | re.S)
+        if information.public_tasks and subtask_match is None:
+            raise ValueError('Active must output a complete <subtask_id> field')
+        task_id = subtask_match.group(1).strip() if subtask_match else None
+        info['selected_subtask_id'] = None if task_id in (None, '', 'null', 'None') else task_id
         self.total_cost += usage
         info["raw_output"] = output
         info["raw_outputs"] = outputs
         info["raw_usage"] = usage
         info["token_usage"] = self.last_usage_metadata
+        info['latency_seconds'] = self.last_call_metrics['elapsed_seconds']
+        info['metrics_call_id'] = self.last_call_metrics['call_id']
         if self.debug:
             print(f"output:\n{output}")
             print(f"total cost: {self.total_cost}")
@@ -674,7 +682,7 @@ class LLM:
             unchecked_containers, ungrabbed_objects, goal_location_room,
             action_history, dialogue_history, opponent_grabbed_objects,
             opponent_last_room, room_explored=None, steps=0, put_options=None,
-            source_event_ids=()):
+            source_event_ids=(), public_tasks=None, agent_control=None):
         """Build once so TRACE and Active Planner see the same legal context."""
         progress = self.progress2text(
             current_room, grabbed_objects, unchecked_containers, ungrabbed_objects,
@@ -703,4 +711,6 @@ class LLM:
             available_actions_with_distance=tuple(with_distance),
             step=int(steps),
             source_event_ids=tuple(source_event_ids),
+            public_tasks=copy.deepcopy(public_tasks or {}),
+            agent_control=copy.deepcopy(agent_control or {}),
         )

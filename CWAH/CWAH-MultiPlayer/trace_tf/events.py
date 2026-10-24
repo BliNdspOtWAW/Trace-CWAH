@@ -148,7 +148,7 @@ class EvidenceLedger:
                                           "kind": kind, "text": text})
 
     def own_action(self, step, action):
-        return self.add(step, "own_action", {"action": action})
+        return self.add(step, "own_action", {"action": action, "status": "selected_not_executed"})
 
     def since(self, cursor):
         return self.events[cursor:]

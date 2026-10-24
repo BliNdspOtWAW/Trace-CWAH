@@ -12,7 +12,7 @@ class RoomMemoryTests(unittest.TestCase):
         agent.steps = 0
         agent.id_inside_room = {}
         agent.ungrabbed_objects = {'kitchen': [], 'bedroom': None}
-        agent.unsatisfied = {'on_12_72': 1}
+        agent.public_tasks = {'S1': {'status': 'active', 'relation': 'on', 'object_id': 12, 'target_id': 72}}
         observation = {
             'nodes': [
                 {'id': 11, 'category': 'Rooms', 'class_name': 'kitchen'},
@@ -24,7 +24,7 @@ class RoomMemoryTests(unittest.TestCase):
         agent._prune_ungrabbed_memory()
         self.assertIn(10, agent.object_memory)
         self.assertEqual(agent.ungrabbed_objects['kitchen'], [])
-        agent.unsatisfied = {'inside_10_103': 1}
+        agent.public_tasks = {'S2': {'status': 'active', 'relation': 'inside', 'object_id': 10, 'target_id': 103}}
         agent._prune_ungrabbed_memory()
         self.assertEqual(agent.ungrabbed_objects['kitchen'][0]['id'], 10)
         agent._remember_observation(observation)

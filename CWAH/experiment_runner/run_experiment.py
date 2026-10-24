@@ -12,9 +12,12 @@ import socket
 import subprocess
 import sys
 import signal
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+from metric_reports import export_metrics
+from result_storage import finalize_artifacts, write_json
 
 
 TRACE_ROOT = Path(__file__).resolve().parents[2]
@@ -31,6 +34,21 @@ class PortUnavailable(ValueError):
 def _path(value):
     candidate = Path(value).expanduser()
     return (candidate if candidate.is_absolute() else TRACE_ROOT / candidate).resolve()
+
+
+def _reply_prompt_path(backend, model, role):
+    """Specialize formatting only for locally configured Qwen model families."""
+    qwen = False
+    if backend == 'huggingface':
+        model_config = _path(model) / 'config.json'
+        if model_config.is_file():
+            kind = json.loads(model_config.read_text(encoding='utf-8')).get('model_type', '')
+            qwen = isinstance(kind, str) and kind.startswith('qwen')
+    variant = 'Qwen_' if qwen else ''
+    path = GAME_ROOT / 'LLM' / f'prompt_Reply_{variant}{role.title()}.txt'
+    if not path.is_file():
+        raise ValueError(f'Missing reply prompt: {path}')
+    return path
 
 
 def _label(value):
@@ -50,6 +68,35 @@ def _sha256(path):
 def validate(config):
     """Validate an explicit local dataset/configuration; never infer a task mapping."""
     dataset_cfg = config["dataset"]
+    backend = config.get('backend', 'openai')
+    if backend not in ('openai', 'huggingface'):
+        raise ValueError('backend must be openai or huggingface')
+    local_options = config.get('local_model', {})
+    if not isinstance(local_options, dict):
+        raise ValueError('local_model must be an object')
+    if backend == 'huggingface':
+        if set(local_options) - {'dtype', 'thinking', 'device_map', 'context_limit'}:
+            raise ValueError('Unsupported local_model option')
+        if local_options.get('dtype', 'bfloat16') not in ('bfloat16', 'float16', 'float32'):
+            raise ValueError('Unsupported local model dtype')
+        if type(local_options.get('thinking', False)) is not bool:
+            raise ValueError('thinking must be boolean')
+        if type(local_options.get('context_limit', 32768)) is not int or local_options.get('context_limit', 32768) < 1:
+            raise ValueError('context_limit must be a positive integer')
+        device = local_options.get('device_map', 'cuda:0')
+        if not isinstance(device, str) or not re.fullmatch(r'cuda:\d+|cpu|auto', device):
+            raise ValueError('device_map must be cuda:N, cpu or auto')
+        for role in ('alice', 'bob'):
+            path = _path(config[role + '_model'])
+            if not (path / 'config.json').is_file():
+                raise ValueError(f'Local model config missing: {path}')
+            index_file = path / 'model.safetensors.index.json'
+            if index_file.is_file():
+                shards = set(json.loads(index_file.read_text()).get('weight_map', {}).values())
+                if not shards or any(not (path / shard).is_file() for shard in shards):
+                    raise ValueError(f'Local model weights incomplete: {path}')
+            elif not (path / 'model.safetensors').is_file():
+                raise ValueError(f'Local model weights incomplete: {path}')
     dataset = _path(dataset_cfg["path"])
     executable = _path(config["executable_file"])
     for name, path in (("dataset", dataset), ("executable", executable)):
@@ -138,13 +185,19 @@ def validate(config):
         prompt_path = _path(raw) if raw else GAME_ROOT / "LLM" / f"prompt_{role.title()}.txt"
         if not prompt_path.is_file() or not prompt_path.read_text(encoding="utf-8").strip():
             raise ValueError(f"{role} prompt missing or empty: {prompt_path}")
+        required = ('$PUBLIC_TASKS', '$AGENT_CONTROL', '<subtask_id>')
+        if not all(value in prompt_path.read_text(encoding='utf-8') for value in required):
+            raise ValueError(f'{role} prompt does not support task-control protocol v2: {prompt_path}')
         prompt_files[role] = prompt_path
     if mode == "on" and "$TRACE_BELIEF" not in prompt_files["alice"].read_text(encoding="utf-8"):
         raise ValueError("TRACE-on Alice prompt must contain $TRACE_BELIEF")
     for role in ('alice', 'bob'):
-        reply_path = GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt'
+        reply_path = _reply_prompt_path(backend, config[role + '_model'], role)
         if not reply_path.is_file() or not reply_path.read_text(encoding='utf-8').strip():
             raise ValueError(f'{role} reply prompt missing or empty: {reply_path}')
+        if not all(value in reply_path.read_text(encoding='utf-8')
+                   for value in ('$PUBLIC_TASKS', '$AGENT_CONTROL', '<new_subtask_id>')):
+            raise ValueError(f'{role} reply prompt does not support task-control protocol v2: {reply_path}')
         if role == 'alice' and mode == 'on' and '$TRACE_BELIEF' not in reply_path.read_text(encoding='utf-8'):
             raise ValueError('TRACE-on Alice reply prompt must contain $TRACE_BELIEF')
     experiment_label = config.get("experiment_label")
@@ -171,6 +224,7 @@ def validate(config):
     if requested_port != "auto" and (type(requested_port) is not int or not 1 <= requested_port <= 65535):
         raise ValueError("port must be 'auto' or an integer between 1 and 65535")
     return {
+        "backend": backend, "local_model": local_options,
         "dataset": dataset,
         "dataset_size": len(episodes),
         "episode_index": index,
@@ -312,7 +366,7 @@ def main(argv=None):
         print("Configuration valid; Unity and LLM were not started.")
         return 0
 
-    for name in ("CWAH_AGENT_API_BASE", "CWAH_HUMAN_API_BASE"):
+    for name in (("CWAH_AGENT_API_BASE", "CWAH_HUMAN_API_BASE") if selected['backend'] == 'openai' else ()):
         if not os.environ.get(name):
             raise ValueError(f"Set {name} in the shell before running")
     with allocated_port(selected["port_request"]) as port:
@@ -321,6 +375,9 @@ def main(argv=None):
 
 
 def _run_validated(config, selected, episode, index, port):
+    reply_files = {role: _reply_prompt_path(selected['backend'], config[role + '_model'], role)
+                   for role in ('alice', 'bob')}
+    run_started = time.monotonic()
     profile_id = selected["profile_id"]
     task_name = _label(str(episode["task_name"]))
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
@@ -331,14 +388,52 @@ def _run_validated(config, selected, episode, index, port):
     category = "trace" if selected["trace_mode"] == "on" else "baseline"
     record_dir = CWAH_ROOT / "experiments" / category / run_id
     record_dir.mkdir(parents=True, exist_ok=False)
+    runtime_dir = record_dir / '.runtime'
+    runtime_dir.mkdir()
+    (record_dir / 'calls.jsonl').touch()
+    write_json(record_dir / 'summary.json', {'status': 'running', 'error': None,
+                                           'episode_index': index})
     child_env = os.environ.copy()
+    child_env['CWAH_AGENT_REPLY_PROMPT_FILE'] = str(reply_files['alice'])
+    child_env['CWAH_HUMAN_REPLY_PROMPT_FILE'] = str(reply_files['bob'])
     child_env["CWAH_AGENT_LM_ID"] = config["alice_model"]
     child_env["CWAH_HUMAN_LM_ID"] = config["bob_model"]
+    if selected['backend'] == 'huggingface':
+        child_env['CWAH_AGENT_LM_ID'] = str(_path(config['alice_model']))
+        child_env['CWAH_HUMAN_LM_ID'] = str(_path(config['bob_model']))
+        child_env['CWAH_LOCAL_MODEL_OPTIONS'] = json.dumps(selected['local_model'])
+        for role in ('CWAH_AGENT', 'CWAH_HUMAN'):
+            for suffix in ('API_BASE', 'API_KEY', 'WIRE_API', 'REASONING_EFFORT'):
+                child_env.pop(role + '_' + suffix, None)
     child_env["PYTHONUNBUFFERED"] = "1"
+    child_env['CWAH_METRICS_PATH'] = str(record_dir / 'calls.jsonl')
+    child_env['CWAH_METRICS_RUN_ID'] = run_id
     child_env.pop("CWAH_PROFILE_SOURCE_TASK", None)
     child_env.pop("CWAH_PROFILE_EXPECTED_TASK", None)
 
     metadata = {
+        'result_format_version': 2, 'trajectory_format_version': 1,
+        'decision_protocol_version': 2,
+        'decision_timing': 'shared_step_start_snapshot; active_barrier; reactive; physical_step',
+        'macro_switch_timing': 'after_current_skill',
+        'llm_metrics_schema_version': 1,
+        'llm_metrics_code_sha256': {
+            'telemetry.py': _sha256(GAME_ROOT / 'LLM' / 'telemetry.py'),
+            'metric_reports.py': _sha256(Path(__file__).with_name('metric_reports.py')),
+        },
+        'llm_metrics_files': ['calls.jsonl'],
+        "backend": selected['backend'], "local_model": selected['local_model'],
+        "local_model_provenance": {
+            role: {
+                'resolved_path': str(_path(config[role + '_model'])),
+                'files_sha256': {
+                    filename: _sha256(_path(config[role + '_model']) / filename)
+                    for filename in ('config.json', 'tokenizer_config.json',
+                                     'model.safetensors.index.json', 'trace_download_manifest.json')
+                    if (_path(config[role + '_model']) / filename).is_file()
+                },
+            } for role in ('alice', 'bob')
+        } if selected['backend'] == 'huggingface' else None,
         "run_id": run_id, "started_at": datetime.now().astimezone().isoformat(),
         "experiment_kind": "WAH episode with independent Bob profile; not a CollabBench Task 26 reproduction",
         "dataset_path": str(selected["dataset"]), "dataset_sha256": _sha256(selected["dataset"]),
@@ -349,7 +444,7 @@ def _run_validated(config, selected, episode, index, port):
         "bob_profile_sha256": _sha256(selected["profile_path"]) if selected["profile_path"] else None,
         "trace_mode": selected["trace_mode"], "alice_model": config["alice_model"],
         "api_protocol": {
-            role: child_env.get(prefix + '_WIRE_API', 'chat')
+            role: child_env.get(prefix + '_WIRE_API', 'chat') if selected['backend'] == 'openai' else None
             for role, prefix in [('alice', 'CWAH_AGENT'), ('bob', 'CWAH_HUMAN')]
         },
         "reasoning_effort": {
@@ -362,11 +457,11 @@ def _run_validated(config, selected, episode, index, port):
         "planner_prompt_files": {role: str(path) for role, path in selected["prompt_files"].items()},
         "planner_prompt_sha256": {role: _sha256(path) for role, path in selected["prompt_files"].items()},
         "reply_prompt_files": {
-            role: str(GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt')
+            role: str(reply_files[role])
             for role in ('alice', 'bob')
         },
         "reply_prompt_sha256": {
-            role: _sha256(GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt')
+            role: _sha256(reply_files[role])
             for role in ('alice', 'bob')
         },
         "bob_model": config["bob_model"], "temperature": config["temperature"],
@@ -374,16 +469,16 @@ def _run_validated(config, selected, episode, index, port):
         "num_runs": config["num_runs"], "port_request": selected["port_request"], "port": port,
         "executable_file": str(selected["executable"]),
         "api_endpoint_hosts": {
-            "alice": urlsplit(child_env["CWAH_AGENT_API_BASE"]).hostname,
-            "bob": urlsplit(child_env["CWAH_HUMAN_API_BASE"]).hostname,
+            "alice": urlsplit(child_env.get("CWAH_AGENT_API_BASE", '')).hostname,
+            "bob": urlsplit(child_env.get("CWAH_HUMAN_API_BASE", '')).hostname,
         },
         "code_commit": _git_revision(), "code_has_uncommitted_changes": _git_dirty(),
         "prompt_sha256": {
             name: _sha256(path) for name, path in {
                 "alice": selected['prompt_files']['alice'],
                 "bob": selected['prompt_files']['bob'],
-                "reply_alice": GAME_ROOT / "LLM" / "prompt_Reply_Alice.txt",
-                "reply_bob": GAME_ROOT / "LLM" / "prompt_Reply_Bob.txt",
+                "reply_alice": reply_files['alice'],
+                "reply_bob": reply_files['bob'],
                 "updater": GAME_ROOT / "trace_tf" / "prompt_Updater.txt",
                 "trace_policy": GAME_ROOT / "trace_tf" / "policy.py",
             }.items()
@@ -393,12 +488,12 @@ def _run_validated(config, selected, episode, index, port):
     (record_dir / "config.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False, default=str) + "\n",
                                              encoding="utf-8")
     command = [sys.executable, "-u", "testing_agents/test_symbolic_LLMs.py",
-               "--communication", "--act", "--cot", "--source", "openai",
-               "--mode", run_id, "--record_dir", str(record_dir),
+               "--communication", "--act", "--cot", "--source", selected['backend'],
+               "--mode", run_id, "--record_dir", str(runtime_dir),
                "--dataset_path", str(selected["dataset"]),
                "--executable_file", str(selected["executable"]),
                "--base-port", str(port), "--lm_id", config["alice_model"],
-               "--api_base", child_env["CWAH_AGENT_API_BASE"],
+               "--api_base", child_env.get("CWAH_AGENT_API_BASE", ''),
                "--t", str(config["temperature"]), "--max_tokens", str(config["max_tokens"]),
                "--max-episode-length", str(config["max_episode_length"]),
                "--num_runs", str(config["num_runs"]), "--num-per-task", "1",
@@ -424,8 +519,14 @@ def _run_validated(config, selected, episode, index, port):
 
     print(f"results={record_dir}", flush=True)
     with (record_dir / "console.log").open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, cwd=GAME_ROOT, env=child_env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, bufsize=1)
+        try:
+            process = subprocess.Popen(command, cwd=GAME_ROOT, env=child_env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except OSError as exc:
+            log.write('Subprocess startup failed: ' + type(exc).__name__ + '\n')
+            return _finish_run(record_dir, index, -1, config['num_runs'], run_started,
+                               startup_error=type(exc).__name__)
+        reported_run_index = -1
         previous_handlers = {}
         def forward_stop(signum, frame):
             if process.poll() is None:
@@ -439,34 +540,49 @@ def _run_validated(config, selected, episode, index, port):
                 step_match = re.match(r"^Step (\d+), Executing script:", line)
                 if step_match:
                     step = int(step_match.group(1)) + 1
+                    with (record_dir / 'calls.jsonl').open('a', encoding='utf-8') as progress:
+                        progress.write(json.dumps({'event': 'environment_step_start', 'step': step,
+                                                   'run_index': max(reported_run_index, 0),
+                                                   'elapsed_seconds': time.monotonic() - run_started}) + '\n')
                     print(f"[progress] {run_id} step={step}/{config['max_episode_length']}", flush=True)
                     log.flush()
                 elif line.startswith(("Init Env", "episode:", "success", "failure", "steps:", "[stop]")):
+                    if line.startswith('episode:'):
+                        reported_run_index += 1
                     print(line, end="", flush=True)
             exit_code = process.wait()
         finally:
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
-    summary = _summary(record_dir, index)
+    return _finish_run(record_dir, index, exit_code, config['num_runs'], run_started)
+
+
+def _finish_run(record_dir, index, exit_code, expected_runs, run_started, startup_error=None):
+    try:
+        summary = _summary(record_dir / '.runtime', index)
+    except (OSError, ValueError, EOFError, pickle.UnpicklingError) as exc:
+        summary = {'status': 'failed', 'episode_index': index,
+                   'error': {'type': type(exc).__name__}}
+    try:
+        summary = finalize_artifacts(record_dir, index, summary, exit_code, expected_runs)
+    except (OSError, ValueError, TypeError, EOFError, pickle.UnpicklingError) as exc:
+        summary.update(status='failed', error={'type': type(exc).__name__,
+                       'details': 'Artifact consolidation failed; original .runtime data retained.'})
+    if startup_error:
+        summary['error'] = {'type': startup_error, 'details': 'Subprocess startup failed; see console.log.'}
     summary["runner_exit_code"] = exit_code
-    (record_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    outcome = ('interrupted' if summary['status'] == 'interrupted' else
-               'completed' if exit_code == 0 and summary['status'] == 'completed'
-               and summary['runs'] == config['num_runs'] else 'failed')
-    (record_dir / "status.md").write_text(
-        f"# Experiment status\n\n- Outcome: {outcome}\n- WAH episode: {index} "
-        f"({episode['task_id']}_{episode['task_name']}, environment {episode['env_id']})\n"
-        f"- Bob profile: {profile_id}; TRACE: {selected['trace_mode']}\n"
-        f"- Continuous subtasks: {selected['continuous_subtasks']['enabled']}; "
-        f"active predicates: {selected['continuous_subtasks']['active_count']}; "
-        f"seed: {selected['continuous_subtasks']['seed']}\n"
-        f"- Planner prompts: Alice `{selected['prompt_files']['alice'].name}`, "
-        f"Bob `{selected['prompt_files']['bob'].name}`\n"
-        f"- Success per run: {summary.get('success', 'unavailable')}\n"
-        f"- Environment steps per run: {summary.get('steps', 'unavailable')}\n"
-        f"- Results: `summary.json`, `results.pik`, `logs_agent_*.pik`; console: `console.log`\n"
-        "- WAH data experiment, not a strict CollabBench Task 26 reproduction.\n",
-        encoding="utf-8")
+    summary['run_wall_seconds'] = time.monotonic() - run_started
+    continuous_summary = summary.get('continuous_subtasks')
+    if isinstance(continuous_summary, dict):
+        summary['completed_subtasks_per_minute'] = (
+            continuous_summary.get('completed_subtasks', 0) * 60 / max(summary['run_wall_seconds'], 1e-9))
+    try:
+        metrics = export_metrics(record_dir)
+        summary['llm_metrics'] = {k: v for k, v in metrics.items() if k not in ('step_windows', 'in_flight_calls')}
+    except (OSError, ValueError) as exc:
+        summary['llm_metrics'] = {'available': False, 'export_error_type': type(exc).__name__}
+    write_json(record_dir / 'summary.json', summary)
+    outcome = summary['status']
     print(f"{outcome}: {record_dir}")
     return 0 if outcome == "completed" else 1
 

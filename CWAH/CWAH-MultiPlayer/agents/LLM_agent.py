@@ -3,9 +3,10 @@ import copy
 from LLM.communication import CommunicationModule
 from trace_tf.updater import HybridUpdater
 from trace_tf.policy import render_policy_context, render_reply_context
+from agents.task_control import TaskControl
 
 
-class LLM_agent:
+class LLM_agent(TaskControl):
 	"""
 	LLM agent class
 	"""
@@ -33,9 +34,7 @@ class LLM_agent:
 		self.goal_objects_name = []
 		self.rooms_name = []
 		self.roomname2id = {}
-		self.unsatisfied = {}
-		self.active_goals = []
-		self.completed_goals = []
+		self.public_tasks = {}
 		self.steps = 0
 		# self.location = None
 		# self.last_location = None
@@ -50,7 +49,6 @@ class LLM_agent:
 		self.last_action = None
 		self.id2node = {}
 		self.id_inside_room = {}
-		self.satisfied = []
 		self.reachable_objects = []
 		self.unchecked_containers = {
 			"livingroom": None,
@@ -79,12 +77,6 @@ class LLM_agent:
 	def _node_matches_goal_object(self, node, object_token):
 		return node['id'] == int(object_token) if object_token.isdigit() else node['class_name'] == object_token
 
-	def _matches_unsatisfied_goal(self, node):
-		return any(
-			count > 0 and self._node_matches_goal_object(node, self._parse_goal(predicate)[1])
-			for predicate, count in getattr(self, 'unsatisfied', {}).items()
-		)
-
 	def _remove_cached_object(self, object_id):
 		"""Invalidate every remembered room location for one observed/stale object."""
 		if object_id in getattr(self, 'object_memory', {}):
@@ -99,7 +91,7 @@ class LLM_agent:
 			for room, objects in self.ungrabbed_objects.items():
 				remembered = []
 				for entry in self.object_memory.values():
-					entry['task_relevant'] = self._matches_unsatisfied_goal(entry['node'])
+					entry['task_relevant'] = self._matches_active_goal(entry['node'])
 					if (entry['room'] == room and entry['location_valid']
 							and not entry.get('held_by') and entry['task_relevant']):
 						remembered.append(entry['node'])
@@ -109,32 +101,8 @@ class LLM_agent:
 		for room, objects in getattr(self, 'ungrabbed_objects', {}).items():
 			if objects is not None:
 				self.ungrabbed_objects[room] = [
-					item for item in objects if self._matches_unsatisfied_goal(item)
+					item for item in objects if self._matches_active_goal(item)
 				]
-
-	def _refresh_active_goals(self, goal, subtask_records=None):
-		records = {
-			f"{item['relation']}_{item['object_id']}_{item['target_id']}": item
-			for item in (subtask_records or [])
-		}
-		self.active_goals = []
-		for predicate, value in goal.items():
-			count = value[0] if isinstance(value, (list, tuple)) else value
-			if count <= 0:
-				continue
-			relation, object_token, target_id = self._parse_goal(predicate)
-			record = records.get(
-				f"{relation}_{object_token}_{target_id}", {}
-			)
-			self.active_goals.append({
-				'predicate': predicate,
-				'relation': relation,
-				'object_token': object_token,
-				'target_id': target_id,
-				'count': count,
-				'object_class': record.get('object_class'),
-				'target_class': record.get('target_class'),
-			})
 
 	def _put_options(self):
 		options = []
@@ -253,10 +221,11 @@ class LLM_agent:
 		source_event_ids = self._trace_source_event_ids()
 		information = self.LLM.build_decision_information(
 			location, self.current_room, [self.id2node[x] for x in self.grabbed_objects],
-			self.satisfied, self.unchecked_containers, self.ungrabbed_objects, None,
+			[], self.unchecked_containers, self.ungrabbed_objects, None,
 			self.action_history, self.dialogue_history, self.opponent_grabbed_objects,
 			self.id_inside_room[self.opponent_agent_id], None, self.steps,
 			put_options=put_options, source_event_ids=source_event_ids,
+			public_tasks=self.public_tasks, agent_control=self.control_context(),
 		)
 		context = ""
 		if self.trace is not None:
@@ -264,7 +233,7 @@ class LLM_agent:
 			context = render_policy_context(self.trace.state, self.trace.ledger)
 		return self.LLM.run(
 			location, self.current_room, [self.id2node[x] for x in self.grabbed_objects],
-			self.satisfied, self.unchecked_containers, self.ungrabbed_objects, None,
+			[], self.unchecked_containers, self.ungrabbed_objects, None,
 			self.action_history, self.dialogue_history, self.opponent_grabbed_objects,
 			self.id_inside_room[self.opponent_agent_id], None, self.steps,
 			belief_context=context, put_options=put_options,
@@ -282,32 +251,8 @@ class LLM_agent:
 		return tuple(ids)
 
 
-	def check_progress(self, state, goal_spec):
-		unsatisfied = {}
-		satisfied = []
-		id2node = {node['id']: node for node in state['nodes']}
-
-		for key, value in goal_spec.items():
-			relation, object_token, target_id = self._parse_goal(key)
-			cnt = value[0]
-			for edge in state['edges']:
-				if cnt == 0:
-					break
-				if (edge['relation_type'].lower() == relation
-						and edge['to_id'] == target_id
-						and self._node_matches_goal_object(id2node[edge['from_id']], object_token)):
-					satisfied.append(id2node[edge['from_id']])
-					cnt -= 1
-					# if self.debug:
-					# 	print(satisfied)
-			if cnt > 0:
-				unsatisfied[key] = cnt
-		return satisfied, unsatisfied
-
-
 	def filter_graph(self, obs):
 		relative_id = [node['id'] for node in obs['nodes'] if node['class_name'] in self.all_relative_name]
-		relative_id = [x for x in relative_id if all([x != y['id'] for y in self.satisfied])]
 		new_graph = {
 			"edges": [edge for edge in obs['edges'] if
 					  edge['from_id'] in relative_id and edge['to_id'] in relative_id],
@@ -330,9 +275,6 @@ class LLM_agent:
 		if self.trace is not None:
 			self.trace.ledger.observe(self.steps, observation)
 
-		satisfied, unsatisfied = self.check_progress(observation, goal)
-		self.unsatisfied = unsatisfied
-		self.satisfied = satisfied
 		self._remember_observation(observation)
 		self._prune_ungrabbed_memory()
 		obs = self.filter_graph(observation)
@@ -355,6 +297,7 @@ class LLM_agent:
 
 		unchecked_containers = []
 		ungrabbed_objects = []
+		target_ids = {goal['target_id'] for goal in self.active_goals}
 		for x in obs['nodes']:
 			# A direct observation supersedes every remembered room location for
 			# this object. The current-room cache is rebuilt below when relevant.
@@ -364,11 +307,9 @@ class LLM_agent:
 			if x['id'] in self.grabbed_objects or x['id'] in [w['id'] for w in opponent_grabbed_objects]:
 				continue
 			self.id_inside_room[x['id']] = self.current_room['class_name']
-			target_ids = {goal['target_id'] for goal in self.active_goals}
 			if x['class_name'] in self.containers_name and 'CLOSED' in x['states'] and x['id'] not in target_ids:
 				unchecked_containers.append(x)
-			if (self._matches_unsatisfied_goal(x)
-					and all([x['id'] != y['id'] for y in self.satisfied])
+			if (self._matches_active_goal(x)
 					and 'GRABBABLE' in x['properties']
 					and x['id'] not in self.grabbed_objects
 					and x['id'] not in [w['id'] for w in opponent_grabbed_objects]):
@@ -392,7 +333,7 @@ class LLM_agent:
 								"unchecked_containers": self.unchecked_containers,
 								"ungrabbed_objects": self.ungrabbed_objects,
 									  },
-						"satisfied": self.satisfied,
+						"public_tasks": copy.deepcopy(self.public_tasks),
 						"current_room": self.current_room['class_name'],
 						},
 				}
@@ -408,17 +349,24 @@ class LLM_agent:
 					print(info)
 				if LM_times > 3:
 					raise Exception(f"retrying LM_plan too many times")
-				plan, a_info = self.LLM_plan(observation['location'])
+				LM_times += 1
+				try:
+					plan, a_info = self.LLM_plan(observation['location'])
+					if plan is not None:
+						self.accept_active_choice(a_info.get('selected_subtask_id'), plan)
+				except ValueError as exc:
+					info.setdefault('planning_errors', []).append(str(exc))
+					continue
 				if plan is None: # NO AVAILABLE PLANS! Explore from scratch!
 					print("No more things to do!")
 					plan = f"[wait]"
-				self.plan = plan
+				if plan.startswith('[wait]'):
+					self.plan = plan
 				self.action_history.append('[send_message]' if plan.startswith('[send_message]') else plan)
 				if "plan" not in a_info.keys():
 					a_info.update({"plan": self.plan})
 				a_info.update({"steps": self.steps})
 				info.update({"LLM": a_info})
-				LM_times += 1
 			if self.plan.startswith('[goexplore]'):
 				action = self.goexplore()
 			elif self.plan.startswith('[gocheck]'):
@@ -438,6 +386,7 @@ class LLM_agent:
 
 		self.steps += 1
 		info.update({"plan": self.plan,
+					"agent_control": self.control_context(),
 					 })
 		if action == self.last_action and self.current_room['class_name'] == self.last_room:
 			self.stuck += 1
@@ -464,6 +413,7 @@ class LLM_agent:
 	
 		if self.trace is not None:
 			self.trace.ledger.own_action(self.steps - 1, action)
+		info['agent_control'] = self.control_context()
 		return action, info
 
 	def receive_dialogue_event(self, event):
@@ -496,7 +446,7 @@ class LLM_agent:
 					'node': copy.deepcopy(node), 'room': room,
 					'last_seen_step': self.steps, 'held_by': held.get(node['id']),
 					'location_valid': True,
-					'task_relevant': self._matches_unsatisfied_goal(node),
+					'task_relevant': self._matches_active_goal(node),
 				}
 				self.id_inside_room[node['id']] = room
 
@@ -504,82 +454,35 @@ class LLM_agent:
 		if self.trace is not None:
 			self.trace.ledger.observe(step, observation)
 
-	def update_task_goal(self, goal, subtask_records=None):
-		"""Refresh a dynamic public goal without touching plans, history, or TRACE."""
-		active = {key: value for key, value in goal.items() if value[0] > 0}
-		if not active:
-			self.active_goals = []
-			self.unsatisfied = {}
-			self.goal_objects_name = []
-			self._prune_ungrabbed_memory()
-			if self.trace is not None and hasattr(self.trace, 'ledger'):
-				self.trace.ledger.set_active_tasks([])
-			if self.goal_location is not None:
-				self.LLM.refresh_goal(
-					self.goal_location, {}, [], getattr(self, 'completed_goals', [])
-				)
-			return
-		self._refresh_active_goals(active, subtask_records)
-		if self.trace is not None and hasattr(self.trace, 'ledger'):
-			self.trace.ledger.set_active_tasks(subtask_records)
-		self.unsatisfied = {key: value[0] for key, value in active.items()}
-		self._prune_ungrabbed_memory()
-		first = self.active_goals[0]
-		known_nodes = getattr(self, 'id2node', {})
-		first_target = known_nodes.get(first['target_id'])
-		first_target_class = first.get('target_class') or (first_target or {}).get('class_name') or 'target'
-		self.goal_location = f"<{first_target_class}> ({first['target_id']})"
-		self.goal_location_id = first['target_id']
-		self.goal_objects_name = []
-		for item in self.active_goals:
-			self.id_inside_room.setdefault(item['target_id'], self.rooms_name[:])
-			if item.get('object_class'):
-				self.goal_objects_name.append(item['object_class'])
-			elif item['object_token'].isdigit():
-				node = known_nodes.get(int(item['object_token']))
-				if node is not None:
-					self.goal_objects_name.append(node['class_name'])
-			else:
-				self.goal_objects_name.append(item['object_token'])
-			target = known_nodes.get(item['target_id'])
-			target_class = item.get('target_class') or (target or {}).get('class_name')
-			if target_class:
-				self.goal_objects_name.append(target_class)
-		self.goal_objects_name = list(dict.fromkeys(self.goal_objects_name))
-		self.LLM.refresh_goal(
-			self.goal_location, self.unsatisfied, subtask_records,
-			getattr(self, 'completed_goals', [])
-		)
-
 	def record_task_completions(self, completed, completed_by=None, step=None):
-		"""Retain public completion history; TRACE receives no hidden graph state."""
+		"""Consume the manager's completed records as evidence, never author task state."""
+		if not hasattr(self, '_reported_completions'):
+			self._reported_completions = set()
 		for task in completed or []:
-			record = dict(task)
-			record['completed_by'] = (completed_by or {}).get(task.get('subtask_id'), 'unknown')
-			if not any(item.get('subtask_id') == record.get('subtask_id')
-					   for item in self.completed_goals):
-				self.completed_goals.append(record)
+			if task.get('subtask_id') in self._reported_completions:
+				continue
+			self._reported_completions.add(task.get('subtask_id'))
 			if self.trace is not None:
 				self.trace.ledger.task_completion(
 					step if step is not None else self.steps,
-					task, record['completed_by'],
+					task, task.get('completed_by') or 'unknown',
 				)
 
 	def reply_to_message(self, message, observation):
 		room = self.current_room['class_name'] if self.current_room else None
 		belief_context = "TRACE is disabled. No teammate belief is available."
 		trace_record = None
-		known_satisfied = [f"<{item['class_name']}> ({item['id']})" for item in self.satisfied]
 		progress = (
-			f"Last selected environment action: {self.last_action or 'None'}\n"
-			f"Known satisfied goal objects: {', '.join(known_satisfied) or 'None'}\n"
-			f"Known remaining goal requirements: {self.unsatisfied or 'Unknown'}"
+			f"Selected environment action for this step (not executed yet): {self.last_action or 'None'}\n"
+			f"Agent control: {self.control_context()}\n"
+			"The public task snapshot and observation describe the same step-start state."
 		)
 		information = self.communication_module.build_decision_information(
 			message, self.dialogue_history, self.plan, observation,
 			agent_id=self.agent_id, progress=progress,
-			action_history=self.action_history[-10:], step=getattr(self, 'steps', 0),
+			action_history=self.action_history[-10:], step=getattr(self, 'steps', 0) - 1,
 			source_event_ids=self._trace_source_event_ids(),
+			public_tasks=getattr(self, 'public_tasks', {}), agent_control=self.control_context(),
 		)
 		if self.trace is not None:
 			state, trace_record = self.trace.update(information.to_dict())
@@ -590,6 +493,12 @@ class LLM_agent:
 			action_history=self.action_history[-10:], belief_context=belief_context,
 			decision_information=information,
 		)
+		try:
+			call['macro_changed'] = self.apply_reactive_target(call.get('new_subtask_id'))
+		except ValueError as exc:
+			call['control_error'] = str(exc)
+			exc.call = call
+			raise
 		call.update({
 			"planner_type": "reactive",
 			"trace_enabled": self.trace is not None,
@@ -598,6 +507,7 @@ class LLM_agent:
 			"trace_new_event_ids": trace_record["new_event_ids"] if trace_record else [],
 			"trace_context": belief_context,
 			"current_skill": self.plan,
+			"agent_control_after": self.control_context(),
 			"action_history": self.action_history[-10:],
 		})
 		return reply, call
@@ -609,7 +519,11 @@ class LLM_agent:
         # room_info: [{'id': 1, 'category': 'Characters', 'class_name': 'character', 'prefab_name': 'Female1', 'obj_transform': {'position': [6.15288, 1.25, -2.417234], 'rotation': [0.0, -0.8562313, 0.0, 0.516592741], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [6.19369459, 0.9142707, -2.387253], 'size': [0.806426048, 1.81487966, 0.94945]}, 'properties': [], 'states': []}, {'id': 2, 'category': 'Characters', 'class_name': 'character', 'prefab_name': 'Male1', 'obj_transform': {'position': [11.0559931, 1.25, -4.948724], 'rotation': [0.0, -0.6762676, 0.0, 0.73665607], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [11.0793667, 2.121052, -4.95072556], 'size': [0.628577232, 1.86971855, 1.38765383]}, 'properties': [], 'states': []}, {'id': 11, 'category': 'Rooms', 'class_name': 'kitchen', 'prefab_name': 'PRE_ROO_Kitchen_01', 'obj_transform': {'position': [0.0, 0.0, 0.0], 'rotation': [0.0, 0.0, 0.0, 1.0], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [1.25, 1.25, 0.0], 'size': [8.0, 3.0, 8.0]}, 'properties': [], 'states': []}, {'id': 172, 'category': 'Rooms', 'class_name': 'bathroom', 'prefab_name': 'PRE_ROO_Bathroom_03', 'obj_transform': {'position': [1.228, 0.0, 6.25], 'rotation': [0.0, 0.7071068, 0.0, 0.7071067], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [2.478, 1.25, 6.25], 'size': [5.5, 3.0, 5.5]}, 'properties': [], 'states': []}, {'id': 210, 'category': 'Rooms', 'class_name': 'bedroom', 'prefab_name': 'PRE_ROO_Bedroom_03', 'obj_transform': {'position': [5.0, 0.0, -2.456], 'rotation': [0.0, 0.0, 0.0, 1.0], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [7.5, 1.25, -3.706], 'size': [5.5, 3.0, 5.5]}, 'properties': [], 'states': []}, {'id': 267, 'category': 'Rooms', 'class_name': 'livingroom', 'prefab_name': 'PRE_ROO_Livingroom_08', 'obj_transform': {'position': [11.25, 0.0, -6.1842], 'rotation': [0.0, -0.7071068, 0.0, 0.7071067], 'scale': [1.0, 1.0, 1.0]}, 'bounding_box': {'center': [13.75, 1.25, -4.9342], 'size': [8.0, 3.0, 8.0]}, 'properties': [], 'states': []}]
         # goal: {'on_pudding_<coffeetable> (268)': [1, True, 2], 'on_juice_<coffeetable> (268)': [1, True, 2], 'on_apple_<coffeetable> (268)': [1, True, 2], 'on_cupcake_<coffeetable> (268)': [2, True, 2]}
 		self.steps = 0
-		self.completed_goals = []
+		self.public_tasks = {}
+		self._uses_public_board = False
+		self.agent_control = {'current_subtask_id': None, 'current_skill': None, 'skill_subtask_id': None}
+		self._reported_completions = set()
+		self.trace = None
 		self.object_memory = {}
 		self.room_visit_counts = {room: 0 for room in rooms_name}
 		self._last_observed_room = None
@@ -620,14 +534,9 @@ class LLM_agent:
 		self.id2node = {x['id']: x for x in obs['nodes']}
 		self.stuck = 0
 		self.last_room = None
-		self.unsatisfied = {k: v[0] for k, v in goal.items()}
-		self._refresh_active_goals(goal)
-		self.satisfied = []
 		self.goal_location = list(goal.keys())[0].split('_')[-1]
 		self.goal_location_id = int(self.goal_location.split(' ')[-1][1:-1])
 		self.id_inside_room = {self.opponent_agent_id: None}
-		for item in self.active_goals:
-			self.id_inside_room[item['target_id']] = self.rooms_name[:]
 		self.unchecked_containers = {
 			"livingroom": None,
 			"kitchen": None,
@@ -649,5 +558,6 @@ class LLM_agent:
 		self.action_history = [f"[goexplore] <{self.current_room['class_name']}> ({self.current_room['id']})"]
 		self.dialogue_history = []
 		self.dialogue_events = []
-		self.LLM.reset(obs,self.rooms_name, self.roomname2id, self.goal_location, self.unsatisfied, task)
+		self.LLM.reset(obs,self.rooms_name, self.roomname2id, self.goal_location, {k: v[0] for k, v in goal.items()}, task)
+		self.update_task_goal(goal)
 		self.trace = HybridUpdater(self.LLM) if self.agent_id == 1 and getattr(self.args, 'trace_mode', 'off') == 'on' else None

@@ -30,6 +30,17 @@ $PROGRESS
 Current high-level skill:
 $CURRENT_SKILL
 
+Public task snapshot at this step's start:
+$PUBLIC_TASKS
+
+Your execution control:
+$AGENT_CONTROL
+You may propose a different active task as your next macro objective. This does not
+cancel the current skill or change the physical action already selected this step.
+The new objective guides the next skill after the current skill finishes. Distinguish
+this future switch from an immediate action. Use null to keep the current objective.
+Do not select completed tasks or invent task IDs.
+
 Previous high-level actions:
 $ACTION_HISTORY
 
@@ -44,4 +55,5 @@ $INCOMING_MESSAGE
 
 Output format:
 <intention>Briefly describe your intended next action.</intention>
+<new_subtask_id>An active public task ID to switch to, or null to retain the objective.</new_subtask_id>
 <reply>A concise reply to your teammate.</reply>

@@ -53,13 +53,14 @@ class PeerCommunicationTests(unittest.TestCase):
         self.assertEqual([agent.reply_calls for agent in arena.agents], [1, 1])
         self.assertEqual([len(agent.history) for agent in arena.agents], [4, 4])
 
-    def test_arena_step_delivers_reply_after_environment_step(self):
+    def test_arena_step_delivers_reply_before_environment_step(self):
         arena = ArenaMP.__new__(ArenaMP)
         env = SimpleNamespace(steps=0)
         env.get_observations = Mock(return_value={0: {}, 1: {}})
         env.get_action_space = Mock(return_value={})
 
         def environment_step(actions):
+            order.append('physical_step')
             env.steps += 1
             return None, 0, False, {}, ["Found apple", None]
 
@@ -79,7 +80,8 @@ class PeerCommunicationTests(unittest.TestCase):
 
         self.assertEqual(env.step.call_count, 1)
         self.assertEqual(env.steps, 1)
-        self.assertEqual(order[0], "post_step_observation")
+        self.assertEqual(order, ['message', 'message', 'physical_step'])
+        self.assertEqual(env.get_observations.call_count, 1)
         self.assertEqual([e["kind"] for e in arena.last_communication_events], ["active", "reply_call", "reply"])
 
     def test_reply_prompt_sees_complete_dialogue_and_only_partial_observation(self):

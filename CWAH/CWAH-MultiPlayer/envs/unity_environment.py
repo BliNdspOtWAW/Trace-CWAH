@@ -511,7 +511,7 @@ class UnityEnvironment(BaseUnityEnvironment):
 		graph = self.get_graph()
 		self.steps += 1
 		if self.continuous_subtasks_enabled:
-			continuous_event = self.continuous_subtasks.advance(graph, self.steps)
+			continuous_event = self.continuous_subtasks.advance(graph, self.steps, action_dict_tobe_changed)
 			self._sync_continuous_goal()
 			reward = float(self.continuous_subtasks.completed_count)
 			done = False

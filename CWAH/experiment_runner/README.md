@@ -77,7 +77,7 @@ CWAH/experiments/baseline/prepare_food_ep44_profilepeer17_trace-off_<时间>/
 CWAH/experiments/trace/prepare_food_ep44_profilepeer17_trace-on_<时间>/
 ```
 
-每个目录含 `config.json`（生效参数、数据及画像 SHA-256、代码 Commit、API 端点主机名，不含 Key）、`console.log`、`results.pik`、`logs_agent_*.pik`、`summary.json` 和 `status.md`。`summary.json` 汇总成功次数、步数、两人的 Planner 调用数、即时回复调用数以及可取得的 TRACE Updater Token 用量；其他模型的 Token 统计未必可得，不应把 0 解释为零成本。原始轨迹包含完整对话和 Prompt，结果目录被 Git 忽略。
+新实验正常结束后仅保留五个文件：`config.json`（生效参数、数据/画像/Prompt 哈希、代码 Commit，不含 Key）、`summary.json`（状态、错误、步数、子任务完成数、耗时和 LLM 指标）、`calls.jsonl`（逐调用 Token、延迟与环境步开始事件）、`trajectory.pik`（全部重复运行的完整轨迹，包括对话、Prompt、TRACE 和任务事件）、`console.log`。缺失的 Token 用量为未知，不应解释为零成本。运行期间 `.runtime/` 保存原评测器输出和逐步检查点，归档验证后清理；异常中断额外保留 `trajectory_checkpoint.pik`，发现无法读取或未知文件时保留 `.runtime/`。旧实验不迁移、不删除。结果目录被 Git 忽略。已移除额外 CSV、窗口报告与报告生成命令；指标直接汇总在 `summary.json`，明细保留在 `calls.jsonl`，详见 `docs/LLM_METRICS.md`。
 
 ## 多配置并行实验
 
