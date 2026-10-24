@@ -8,7 +8,9 @@ import pandas as pd
 from openai.error import OpenAIError
 import backoff
 from trace_tf.information import DecisionInformation
+from trace_tf.peer_observation import render_peer_context
 from .responses_client import generate_responses
+from .active_protocol import parse_trace_active
 from .telemetry import measured_generate
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
@@ -233,7 +235,7 @@ class LLM:
             else:
                 self.personality = ''
         elif self.big_5_act is not None:
-          
+
             if self.agent_id == 1:
                 self.personality = ""
             else:
@@ -241,7 +243,7 @@ class LLM:
                 self.personality = profile_dict.get(profile_key, "")
                 if profile_key != self.task:
                     print(f"[LLM] teammate profile: {self.task} -> {profile_key}")
-                
+
         else:
             self.personality = ""
         self.id2node = {x['id']: x for x in obs['nodes']}
@@ -368,8 +370,13 @@ class LLM:
         action_tag_match = re.search(r'<action>(.*?)</action>', text, re.IGNORECASE | re.DOTALL)
         if action_tag_match:
             action_content = action_tag_match.group(1).strip()
+            if not action_content:
+                return None, think_content, None
             # 兼容模型输出如 "A. [walktowards] ..."：先去掉前缀选项字母，避免误选 available_actions[0]
             action_content = re.sub(r'^\s*(?:\(?[A-Z]\)?)[\s\.\:\)]\s*', '', action_content).strip()
+
+            if not action_content:
+                return None, think_content, None
 
             # 精确匹配 available_actions
             for action in available_actions:
@@ -428,20 +435,20 @@ class LLM:
 
             # 如果还是没有匹配，随机选择
             if chosen_action is None:
-                print("WARNING! No available action parsed!!! Random choose one")
-                chosen_action = random.choice(available_actions)
+                print("WARNING! No available action parsed!!! No action executed")
+                chosen_action = None
 
             # 如果动作是 send_message，则附加 message 内容
-            if chosen_action.startswith('[send_message]'):
+            if chosen_action and chosen_action.startswith('[send_message]'):
                 chosen_action = f"{chosen_action} <{message_content or ''}>"
 
             return chosen_action, think_content, message_content
 
-        # 如果没有 <action> 标签，则返回 None 或随机
+        # Missing/empty/unmatched actions execute nothing this step.
         print("WARNING! No <action> tag found")
-        return random.choice(available_actions), think_content, message_content
+        return None, think_content, None
 
-    def progress2text(self, current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored):
+    def progress2text(self, current_room, grabbed_objects, unchecked_containers, ungrabbed_objects, goal_location_room, satisfied, opponent_grabbed_objects, opponent_last_room, room_explored, peer_observation=None, peer_memory=None):
         sss = {}
         for room, objs in ungrabbed_objects.items():
             cons = unchecked_containers[room]
@@ -494,21 +501,9 @@ class LLM:
             if len(grabbed_objects) == 2:
                 s = s[:-2] + f" and <{grabbed_objects[1]['class_name']}> ({grabbed_objects[1]['id']}). "
         s += f"I'm in the {current_room['class_name']}, where I found {sss[current_room['class_name']]}. "
-        # opponent modeling
+        # Room/holding memory is never proof of current visibility.
         if not self.single:
-            ss = ""
-            if len(opponent_grabbed_objects) == 0:
-                ss += "nothing. "
-            else:
-                ss += f"<{opponent_grabbed_objects[0]['class_name']}> ({opponent_grabbed_objects[0]['id']}). "
-                if len(opponent_grabbed_objects) == 2:
-                    ss = ss[:-2] + f" and <{opponent_grabbed_objects[1]['class_name']}> ({opponent_grabbed_objects[1]['id']}). "
-            if opponent_last_room is None:
-                s += f"I don't know where {self.oppo_name} is. "
-            elif opponent_last_room == current_room['class_name']:
-                s += f"I also see {self.oppo_name} here in the {current_room['class_name']}, {self.oppo_pronoun} is holding {ss}"
-            else:
-                s += f"Last time I saw {self.oppo_name} was in the {opponent_last_room}, {self.oppo_pronoun} was holding {ss}"
+            s += render_peer_context(peer_observation, peer_memory, self.oppo_name)
         for room in self.rooms:
             if room == current_room['class_name']:
                 continue
@@ -572,14 +567,14 @@ class LLM:
                 available_plans_refine[i] = plan.split(" - distance:")[0]
         for i, plan in enumerate(available_plans_refine):
             plans_refine += f"{chr(ord('A') + i)}. {plan}\n"
-            
+
         print("**************plan*******************")
         print(plans)
         print("************plans_refine*************")
         print(plans_refine)
         print("*************************************")
-        
-        
+
+
         return plans, plans_refine, available_plans, available_plans_refine, len(available_plans)
 
     def run(self, location, current_room, grabbed_objects, satisfied, unchecked_containers,
@@ -621,6 +616,13 @@ class LLM:
         prompt = prompt.replace('$ACTIONS_REFINE', available_plans_refine)
         if self.debug:
             print(f"prompt:\n{prompt}")
+        if 'TRACE-v2 teammate belief' in belief_context:
+            # Last output example must agree with the TRACE-only validator.
+            from trace_tf.policy import COMMUNICATION_INSTRUCTIONS
+            prompt += '\nFINAL TRACE OUTPUT CONTRACT (replaces generic message examples):\n' + COMMUNICATION_INSTRUCTIONS
+            error = getattr(self, 'active_retry_error', None)
+            if error:
+                prompt += '\nPrevious output was rejected: ' + error + '\nCorrect the protocol and output one complete valid choice.\n'
         chat_prompt = [{"role": "user", "content": prompt}]
         info["raw_prompt"] = prompt
         info["trace_belief_context"] = belief_context
@@ -634,11 +636,21 @@ class LLM:
             })
         output = outputs[0]
         import re
-        subtask_match = re.search(r'<subtask_id>\s*(.*?)\s*</subtask_id>', output, re.I | re.S)
-        if information.public_tasks and subtask_match is None:
-            raise ValueError('Active must output a complete <subtask_id> field')
-        task_id = subtask_match.group(1).strip() if subtask_match else None
-        info['selected_subtask_id'] = None if task_id in (None, '', 'null', 'None') else task_id
+        trace_protocol = None
+        if 'TRACE-v2 teammate belief' in belief_context:
+            trace_protocol = parse_trace_active(output, available_plans_list_refine)
+            if (trace_protocol['plan'] is not None and information.public_tasks
+                    and not trace_protocol.get('has_subtask_field')):
+                raise ValueError('Active must output a top-level <subtask_id> field')
+            info['selected_subtask_id'] = trace_protocol['subtask_id']
+        else:
+            subtask_match = re.search(r'<subtask_id>\s*(.*?)\s*</subtask_id>', output, re.I | re.S)
+            action_match = re.search(r'<action>\s*(.*?)\s*</action>', output, re.I | re.S)
+            empty_action = action_match is None or not action_match.group(1).strip()
+            if information.public_tasks and subtask_match is None and not empty_action:
+                raise ValueError('Active must output a complete <subtask_id> field')
+            task_id = subtask_match.group(1).strip() if subtask_match else None
+            info['selected_subtask_id'] = None if task_id in (None, '', 'null', 'None') else task_id
         self.total_cost += usage
         info["raw_output"] = output
         info["raw_outputs"] = outputs
@@ -649,7 +661,29 @@ class LLM:
         if self.debug:
             print(f"output:\n{output}")
             print(f"total cost: {self.total_cost}")
-        plan,think, message = self.parse_answer(available_plans_list_refine, output)
+        if trace_protocol is not None:
+            plan, think, message = (trace_protocol[key] for key in ('plan', 'think', 'message'))
+        else:
+            plan,think, message = self.parse_answer(available_plans_list_refine, output)
+        if plan is None:
+            info['selected_subtask_id'] = None
+            info['action_parse_status'] = 'no_action'
+            message = None
+        if 'TRACE-v2 teammate belief' in belief_context and plan and plan.startswith('[send_message]'):
+            kind = trace_protocol['communication_type']
+            if kind not in ('delegate', 'probe_intent'):
+                raise ValueError('TRACE-v2 send_message requires delegate or probe_intent')
+            selected = info['selected_subtask_id']
+            if kind == 'delegate' and information.public_tasks.get(selected, {}).get('status') != 'active':
+                raise ValueError('delegate requires one active public subtask')
+            if kind == 'probe_intent' and selected is not None:
+                raise ValueError('intent probe must use null subtask_id')
+            if not message or not message.strip() or len(message) > 500:
+                raise ValueError('TRACE-v2 communication needs 1..500 characters')
+            info['trace_communication'] = {'type': kind, 'subtask_id': selected}
+            # Construct delivery from validated prose; never reuse raw tagged text.
+            plan = '[send_message] <' + message + '>'
+
         if self.debug:
             print(f"plan: {plan}\n")
         # 追加所有prompt构造需要的主要变量到info，便于调试和后处理  $AVAILABLE_ACTIONS_REFINE
@@ -682,12 +716,14 @@ class LLM:
             unchecked_containers, ungrabbed_objects, goal_location_room,
             action_history, dialogue_history, opponent_grabbed_objects,
             opponent_last_room, room_explored=None, steps=0, put_options=None,
-            source_event_ids=(), public_tasks=None, agent_control=None):
+            source_event_ids=(), public_tasks=None, agent_control=None,
+            peer_observation=None, peer_memory=None):
         """Build once so TRACE and Active Planner see the same legal context."""
         progress = self.progress2text(
             current_room, grabbed_objects, unchecked_containers, ungrabbed_objects,
             goal_location_room, satisfied, opponent_grabbed_objects,
             opponent_last_room, room_explored,
+            peer_observation=peer_observation, peer_memory=peer_memory,
         )
         visits = getattr(self, 'room_visit_counts', {})
         if visits:
@@ -713,4 +749,6 @@ class LLM:
             source_event_ids=tuple(source_event_ids),
             public_tasks=copy.deepcopy(public_tasks or {}),
             agent_control=copy.deepcopy(agent_control or {}),
+            peer_observation=copy.deepcopy(peer_observation or {}),
+            peer_memory=copy.deepcopy(peer_memory or {}),
         )

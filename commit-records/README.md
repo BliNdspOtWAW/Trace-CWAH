@@ -1,6 +1,8 @@
 # Commit records
 
-Keep concise verification notes for notable TRACE commits here. Name each
-record `YYYY-MM-DD-short-topic.md` and include the related commit hash, checks
-performed, and known limitations. Git history remains the source of truth for
-the actual code changes; not every small commit needs a separate note.
+- trace-v1/: historical records preceding the CWAH-TF-v2 implementation.
+- trace-v2/: CWAH-TF-v2 joint Intent/Beta beliefs and offline agreement analysis.
+
+Each record describes changes, verification and limitations. Git history is the
+source of truth. A record included in its own implementation commit identifies
+that commit via git log --follow -- <record-path> rather than a circular SHA.

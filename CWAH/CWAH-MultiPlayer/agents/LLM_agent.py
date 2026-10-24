@@ -2,6 +2,7 @@ from LLM import *
 import copy
 from LLM.communication import CommunicationModule
 from trace_tf.updater import HybridUpdater
+from trace_tf.peer_observation import PeerStateTracker
 from trace_tf.policy import render_policy_context, render_reply_context
 from agents.task_control import TaskControl
 
@@ -226,6 +227,7 @@ class LLM_agent(TaskControl):
 			self.id_inside_room[self.opponent_agent_id], None, self.steps,
 			put_options=put_options, source_event_ids=source_event_ids,
 			public_tasks=self.public_tasks, agent_control=self.control_context(),
+			**self._peer_context(),
 		)
 		context = ""
 		if self.trace is not None:
@@ -339,9 +341,10 @@ class LLM_agent(TaskControl):
 				}
 		info['obs']['room_visit_counts'] = dict(self.room_visit_counts)
 		info['obs']['object_memory'] = copy.deepcopy(self.object_memory)
-		if self.id_inside_room[self.opponent_agent_id] == self.current_room['class_name']:
-			self.opponent_grabbed_objects = opponent_grabbed_objects
+		# This legacy execution list is current-only; historical holdings live in peer_memory.
+		self.opponent_grabbed_objects = opponent_grabbed_objects
 		action = None
+		self.LLM.active_retry_error = None
 		LM_times = 0
 		while action is None:
 			if self.plan is None:
@@ -354,12 +357,20 @@ class LLM_agent(TaskControl):
 					plan, a_info = self.LLM_plan(observation['location'])
 					if plan is not None:
 						self.accept_active_choice(a_info.get('selected_subtask_id'), plan)
+						if self.trace is not None and a_info.get('trace_communication'):
+							self.trace.stage_communication(a_info['trace_communication'])
 				except ValueError as exc:
 					info.setdefault('planning_errors', []).append(str(exc))
+					self.LLM.active_retry_error = str(exc)
 					continue
-				if plan is None: # NO AVAILABLE PLANS! Explore from scratch!
-					print("No more things to do!")
-					plan = f"[wait]"
+				if plan is None:
+					# A parsed empty action consumes this step without a physical/message
+					# action. Do not install a persistent wait skill or retry this step.
+					self.plan = None
+					a_info.update({'plan': None, 'no_action': True, 'steps': self.steps})
+					info['LLM'] = a_info
+					self.action_history.append('[no_action]')
+					break
 				if plan.startswith('[wait]'):
 					self.plan = plan
 				self.action_history.append('[send_message]' if plan.startswith('[send_message]') else plan)
@@ -379,6 +390,7 @@ class LLM_agent(TaskControl):
 				action = self.plan[:]
 				self.plan = None
 			elif self.plan.startswith('[wait]'):
+				self.plan = None
 				action = None
 				break
 			else:
@@ -420,10 +432,21 @@ class LLM_agent(TaskControl):
 		self.dialogue_events.append(event.copy())
 		self.dialogue_history.append(f"{self.agent_names[event['sender'] + 1]}: {event['text']}")
 		if self.trace is not None:
-			self.trace.ledger.message(event['step'], event['sender'], event['receiver'], event['text'], event['kind'])
+			self.trace.receive_message(event)
+
+	def _peer_context(self):
+		if not hasattr(self, 'peer_tracker'):
+			observer_id = getattr(self, 'agent_id', 1)
+			self.peer_tracker = PeerStateTracker(observer_id, 3 - observer_id)
+		return self.peer_tracker.snapshot()
+
+	def _observe_peer(self, observation, step):
+		self._peer_context()
+		return self.peer_tracker.observe(observation, step)
 
 	def _remember_observation(self, observation):
 		"""Retain every observed movable object, independently of the active task."""
+		self._observe_peer(observation, getattr(self, 'steps', 0))
 		if not hasattr(self, 'object_memory'):
 			self.object_memory = {}
 		if not hasattr(self, 'room_visit_counts'):
@@ -451,6 +474,7 @@ class LLM_agent(TaskControl):
 				self.id_inside_room[node['id']] = room
 
 	def observe_trace_outcome(self, observation, step):
+		self._observe_peer(observation, step)
 		if self.trace is not None:
 			self.trace.ledger.observe(step, observation)
 
@@ -469,6 +493,8 @@ class LLM_agent(TaskControl):
 				)
 
 	def reply_to_message(self, message, observation):
+		decision_step = max(0, getattr(self, 'steps', 0) - 1)
+		self._observe_peer(observation, decision_step)
 		room = self.current_room['class_name'] if self.current_room else None
 		belief_context = "TRACE is disabled. No teammate belief is available."
 		trace_record = None
@@ -480,9 +506,10 @@ class LLM_agent(TaskControl):
 		information = self.communication_module.build_decision_information(
 			message, self.dialogue_history, self.plan, observation,
 			agent_id=self.agent_id, progress=progress,
-			action_history=self.action_history[-10:], step=getattr(self, 'steps', 0) - 1,
+			action_history=self.action_history[-10:], step=decision_step,
 			source_event_ids=self._trace_source_event_ids(),
 			public_tasks=getattr(self, 'public_tasks', {}), agent_control=self.control_context(),
+			**self._peer_context(),
 		)
 		if self.trace is not None:
 			state, trace_record = self.trace.update(information.to_dict())
@@ -527,6 +554,8 @@ class LLM_agent(TaskControl):
 		self.object_memory = {}
 		self.room_visit_counts = {room: 0 for room in rooms_name}
 		self._last_observed_room = None
+		self.peer_tracker = PeerStateTracker(self.agent_id, self.opponent_agent_id)
+		self.peer_tracker.observe(obs, 0)
 		self.containers_name = containers_name
 		self.goal_objects_name = goal_objects_name
 		self.rooms_name = rooms_name

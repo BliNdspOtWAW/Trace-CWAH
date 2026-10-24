@@ -65,6 +65,26 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def resolve_results_root(value=None):
+    """Keep configurable experiment outputs inside this CWAH experiments tree."""
+    base = (CWAH_ROOT / 'experiments').resolve()
+    if value is None:
+        return base
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('results_root must be a nonempty path string')
+    target = _path(value)
+    try:
+        target.relative_to(base)
+    except ValueError as exc:
+        raise ValueError('results_root must stay inside CWAH/experiments') from exc
+    return target
+
+
+def result_directory(selected, run_id):
+    category = 'trace' if selected['trace_mode'] == 'on' else 'baseline'
+    return Path(selected.get('results_root') or CWAH_ROOT / 'experiments') / category / run_id
+
+
 def validate(config):
     """Validate an explicit local dataset/configuration; never infer a task mapping."""
     dataset_cfg = config["dataset"]
@@ -225,6 +245,7 @@ def validate(config):
         raise ValueError("port must be 'auto' or an integer between 1 and 65535")
     return {
         "backend": backend, "local_model": local_options,
+        "results_root": resolve_results_root(config["results_root"]) if config.get("results_root") is not None else None,
         "dataset": dataset,
         "dataset_size": len(episodes),
         "episode_index": index,
@@ -361,6 +382,7 @@ def main(argv=None):
           f"TRACE={selected['trace_mode']}, continuous={selected['continuous_subtasks']['enabled']}, "
           f"port={selected['port_request']}")
     print(f"dataset={selected['dataset']}")
+    print("results_root=" + str(selected.get("results_root") or CWAH_ROOT / "experiments"))
     print("planner_prompts=" + ", ".join(f"{role}:{path.name}" for role, path in selected["prompt_files"].items()))
     if args.check:
         print("Configuration valid; Unity and LLM were not started.")
@@ -385,8 +407,7 @@ def _run_validated(config, selected, episode, index, port):
     continuous_label = "_continuous" if selected["continuous_subtasks"]["enabled"] else ""
     run_id = (f"{task_name}_ep{index}_profile{profile_id}_trace-{selected['trace_mode']}"
               f"{continuous_label}{label}_{timestamp}")
-    category = "trace" if selected["trace_mode"] == "on" else "baseline"
-    record_dir = CWAH_ROOT / "experiments" / category / run_id
+    record_dir = result_directory(selected, run_id)
     record_dir.mkdir(parents=True, exist_ok=False)
     runtime_dir = record_dir / '.runtime'
     runtime_dir.mkdir()
@@ -435,6 +456,7 @@ def _run_validated(config, selected, episode, index, port):
             } for role in ('alice', 'bob')
         } if selected['backend'] == 'huggingface' else None,
         "run_id": run_id, "started_at": datetime.now().astimezone().isoformat(),
+        "results_root": str(record_dir.parent.parent),
         "experiment_kind": "WAH episode with independent Bob profile; not a CollabBench Task 26 reproduction",
         "dataset_path": str(selected["dataset"]), "dataset_sha256": _sha256(selected["dataset"]),
         "episode_index": index, "task_id": episode["task_id"], "task_name": episode["task_name"],

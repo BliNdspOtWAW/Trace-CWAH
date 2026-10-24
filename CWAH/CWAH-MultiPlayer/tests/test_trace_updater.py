@@ -1,398 +1,246 @@
-"""TRACE updater safety and state tests; no Unity or network."""
-
+"""TRACE-v2 protocol regression tests, no Unity, GPU or API calls."""
+import copy
 import json
+import math
 import unittest
+import tempfile
+import pickle
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
-
+from unittest.mock import Mock, patch
 from trace_tf.updater import HybridUpdater
-from trace_tf.policy import render_policy_context
-from trace_tf.information import DecisionInformation
-from LLM.LLM import LLM
+from trace_tf.probability import candidates, uniform, distribution, align_prior, beta_stats
+from trace_tf.policy import render_policy_context, render_reply_context
 
+TASK = {'subtask_id': 'S1', 'object_id': 12, 'created_step': 0, 'status': 'active',
+        'object_class': 'apple', 'relation': 'on', 'target_id': 20, 'target_class': 'table'}
 
-def observation(edges=()):
-    return {
-        "nodes": [
-            {"id": 1, "class_name": "character", "category": "Characters"},
-            {"id": 2, "class_name": "character", "category": "Characters"},
-            {"id": 12, "class_name": "apple", "category": "Objects"},
-        ],
-        "edges": list(edges), "location": [0, 0, 0],
-        "hidden_profile": "PRIVATE_PROFILE_NEVER_ENTER_PROMPT",
-        "peer_private_plan": "PRIVATE_PLAN_NEVER_ENTER_PROMPT",
-    }
+def obs(bob=True, holds=False):
+    return {'nodes': [{'id': i, 'class_name': name, 'category': 'Objects'}
+                      for i, name in [(1, 'character'), (12, 'apple')] + ([(2, 'character')] if bob else [])],
+            'edges': [{'from_id': 2, 'to_id': 12, 'relation_type': 'HOLDS_RH'}] if holds else [],
+            'hidden_profile': 'SECRET_PROFILE', 'peer_private_plan': 'SECRET_PLAN'}
 
+def info(step=0, kind='active', tasks=None):
+    return {'step': step, 'planner_type': kind, 'public_tasks': {'S1': TASK} if tasks is None else tasks}
 
-def planner_output(acceptance_id=None, evidence_ids=()):
-    return {
-        "intent": {"action": "gograb", "target": "apple", "evidence_ids": list(evidence_ids)},
-        "preference": {"description": None, "evidence_ids": []},
-        "commitments": ([{
-            "acceptance_event_id": acceptance_id,
-            "subtask_id": "subtask-apple-table",
-            "action": "grab", "object": "apple",
-            "evidence_ids": [acceptance_id], "proposed_status": "fulfilled",
-        }] if acceptance_id else []),
-        "uncertainty": {"intent": 0.0, "capability": 0.0,
-                        "preference": 0.0, "reliability": 0.0},
-    }
-
-
-TASK = {
-    "subtask_id": "subtask-apple-table", "object_id": 12,
-    "created_step": 0,
-    "object_class": "apple", "relation": "on", "target_id": 20,
-    "target_class": "kitchentable",
-}
-
+def message(sender, text, kind='active', step=0, **extra):
+    return dict(step=step, sender=sender, receiver=1-sender, text=text, kind=kind, **extra)
 
 class TraceUpdaterTests(unittest.TestCase):
-    def make_updater(self, answer):
-        planner = SimpleNamespace(
-            sampling_params={"n": 1, "max_tokens": 1024, "temperature": 0},
-            chat=True, lm_id="test", last_usage_metadata={"total_tokens": 20},
-            generator=Mock(return_value=([json.dumps(answer)], 0)),
-        )
-        return HybridUpdater(planner), planner
-
-    def test_one_call_four_uncertainties_and_no_private_fields(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.observe(0, observation())
-        state, record = updater.update()
-        self.assertEqual(planner.generator.call_count, 1)
-        self.assertEqual(state.dimensions["uncertainty"].value["overall"], 1.0)
-        self.assertEqual(set(state.dimensions["uncertainty"].value["per_dimension"]),
-                         {"intent", "capability", "preference", "reliability"})
-        self.assertIn("e00000", state.dimensions["information"].value["event_ids"])
-        self.assertIn("PRIVATE_PROFILE_NEVER_ENTER_PROMPT", str(observation()))
-        self.assertNotIn("PRIVATE_PROFILE_NEVER_ENTER_PROMPT", record["llm_call"]["prompt"])
-        self.assertNotIn("PRIVATE_PLAN_NEVER_ENTER_PROMPT", render_policy_context(state, updater.ledger))
-        updater.update()
-        self.assertEqual(planner.generator.call_count, 1)
-
-    def test_self_report_does_not_fulfill_commitment_but_visible_grab_does(self):
-        updater, planner = self.make_updater(planner_output())
+    def make(self):
+        planner = SimpleNamespace(sampling_params={'n': 1, 'max_tokens': 1024}, chat=True,
+            lm_id='test', last_usage_metadata={}, generator=Mock())
+        updater = HybridUpdater(planner)
         updater.ledger.set_active_tasks([TASK])
-        updater.ledger.observe(0, observation())
-        message = updater.ledger.message(0, 1, 0, "Alice, I will grab the apple.", "active")
-        planner.generator.return_value = ([json.dumps(planner_output(message.event_id, [message.event_id]))], 0)
-        state, _ = updater.update()
-        reliability = state.dimensions["reliability"].value
-        self.assertIsNone(reliability["fulfillment_rate"])
-        self.assertEqual(reliability["commitment_events"][0]["status"], "pending")
-        self.assertEqual(state.dimensions["uncertainty"].value["per_dimension"]["reliability"], 1.0)
+        self.answer(updater, planner)
+        return updater, planner
 
-        # Bob saying "done" is still only a claim.
-        updater.ledger.message(1, 1, 0, "I grabbed it", "reply")
-        state, _ = updater.update()
-        self.assertIsNone(state.dimensions["reliability"].value["fulfillment_rate"])
+    def answer(self, updater, planner, responses=(), tasks=None):
+        support = candidates({'S1': TASK} if tasks is None else tasks)
+        dist = uniform(support)
+        planner.generator.return_value = ([json.dumps({'intent': {
+            'task_probs': dist['task_probs'], 'skill_given_task': dist['skill_given_task']},
+            'delegation_responses': list(responses)})], 0)
 
-        updater.ledger.observe(2, observation([{"from_id": 2, "to_id": 12,
-                                                 "relation_type": "HOLDS_RH"}]))
-        updater.ledger.task_completion(3, TASK, "Bob")
-        state, _ = updater.update()
-        self.assertEqual(state.dimensions["capability"].value["success_rate"], 1.0)
-        self.assertEqual(state.dimensions["reliability"].value["fulfillment_rate"], 1.0)
-        self.assertEqual(state.dimensions["reliability"].value["commitment_events"][0]["status"], "fulfilled")
-        self.assertGreaterEqual(state.dimensions["uncertainty"].value["overall"], 0.25)
+    def delegate(self, updater, kind='delegate'):
+        updater.stage_communication({'type': kind, 'subtask_id': 'S1' if kind == 'delegate' else None})
+        request = updater.receive_message(message(0, 'Please complete S1' if kind == 'delegate' else 'What task?'))
+        reply = updater.receive_message(message(1, 'I accept S1', 'reply', parent_sender=0))
+        return {'request_event_id': request.event_id, 'reply_event_id': reply.event_id, 'response': 'accepted'}
 
-    def test_silence_and_unaccepted_request_are_not_violations(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.observe(0, observation())
-        updater.ledger.set_active_tasks([TASK])
-        updater.ledger.message(0, 0, 1, "Please search the kitchen", "active")
-        state, _ = updater.update()
-        self.assertEqual(planner.generator.call_count, 1)
-        self.assertEqual(state.dimensions["reliability"].status, "unknown")
-        self.assertEqual(state.dimensions["capability"].status, "unknown")
-        self.assertEqual(state.dimensions["uncertainty"].value["overall"], 1.0)
+    def test_beta_prior_success_failure_and_normalized_variance(self):
+        self.assertEqual(beta_stats(0, 0)['mean'], 0.5)
+        self.assertEqual(beta_stats(0, 0)['normalized_variance'], 1)
+        self.assertAlmostEqual(beta_stats(1, 0)['mean'], 2/3)
+        self.assertAlmostEqual(beta_stats(1, 0)['normalized_variance'], 2/3)
+        self.assertAlmostEqual(beta_stats(0, 1)['mean'], 1/3)
+        self.assertAlmostEqual(beta_stats(20, 20)['normalized_variance'], 3/43)
 
-    def test_intent_returns_to_unknown_when_new_evidence_no_longer_supports_it(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.observe(0, observation())
-        message = updater.ledger.message(0, 1, 0, "I will grab the apple", "active")
-        planner.generator.return_value = ([json.dumps(planner_output(None, [message.event_id]))], 0)
-        first, _ = updater.update()
-        self.assertEqual(first.dimensions["intent"].status, "supported")
-        unknown = planner_output()
-        unknown["intent"] = {"action": None, "target": None, "evidence_ids": []}
-        planner.generator.return_value = ([json.dumps(unknown)], 0)
-        updater.ledger.observe(1, observation())
-        second, _ = updater.update()
-        self.assertEqual(second.dimensions["intent"].status, "unknown")
-        self.assertEqual(second.dimensions["uncertainty"].value["per_dimension"]["intent"], 1.0)
+    def test_joint_entropy_and_exact_support_validation(self):
+        support = candidates({'S1': TASK})
+        value = uniform(support)
+        self.assertAlmostEqual(sum(x['probability'] for x in value['joint']), 1)
+        self.assertAlmostEqual(value['normalized_entropy'], 1)
+        self.assertEqual(value['support_size'], 10)
+        for invalid in (-1, True, float('nan'), float('inf')):
+            bad = copy.deepcopy(value['skill_given_task'])
+            bad['S1']['gograb'] = invalid
+            with self.assertRaises(ValueError):
+                distribution(value['task_probs'], bad, support)
+        bad = dict(value['task_probs'], hidden_task=1)
+        with self.assertRaises(ValueError):
+            distribution(bad, value['skill_given_task'], support)
 
-    def test_alice_request_alone_cannot_establish_bob_intent(self):
-        updater, planner = self.make_updater(planner_output())
-        request = updater.ledger.message(0, 0, 1, "Bob, please grab the apple", "active")
-        planner.generator.return_value = ([json.dumps(planner_output(None, [request.event_id]))], 0)
-        state, _ = updater.update()
-        self.assertEqual(state.dimensions["intent"].status, "unknown")
+    def test_decision_boundaries_not_environment_observations(self):
+        u, p = self.make()
+        u.ledger.observe(0, obs())
+        u.update(info())
+        u.ledger.observe(1, obs())
+        u.ledger.observe(2, obs(holds=True))
+        self.assertEqual(p.generator.call_count, 1)
+        _, record = u.update(info(2, 'reactive'))
+        self.assertEqual(record['decision_id'], 2)
+        self.assertEqual(record['planner_type'], 'reactive')
+        self.assertEqual([e['step'] for e in record['legal_interval_events'] if e['kind'] == 'observation'], [1, 2])
+        u.update(info(2, 'active'))
+        self.assertEqual(p.generator.call_count, 3)
+        self.assertEqual(u.update_log[-1]['new_event_ids'], [])
+        u.update()
+        self.assertEqual(p.generator.call_count, 3)
 
-    def test_planner_information_is_stored_and_sent_to_updater(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.observe(7, observation([{"from_id": 2, "to_id": 12,
-                                                "relation_type": "HOLDS_RH"}]))
-        information = DecisionInformation(
-            planner_type="active",
-            goal="put apple on table",
-            personality="curious",
-            current_progress="Bob is visible holding apple (12)",
-            action_history=("[goexplore] <kitchen> (11)",),
-            dialogue_history=("Bob: I found the apple.",),
-            available_actions=("[goput] <apple> (12) <table> (20)",),
-            step=7,
-            source_event_ids=("e00000",),
-        ).to_dict()
-
-        state, record = updater.update(information)
-
-        stored = state.dimensions["information"].value
-        self.assertEqual(stored["goal"], "put apple on table")
-        self.assertEqual(stored["planner_type"], "active")
-        prompt = record["llm_call"]["prompt"]
-        self.assertIn("Information shared with the planner", prompt)
-        self.assertIn("put apple on table", prompt)
-        self.assertIn("Bob visibly holds <apple> (12)", prompt)
-        self.assertNotIn("$COMMITMENTS", prompt)
-
-    def test_commitments_live_inside_reliability_and_capability_is_rule_scored(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.set_active_tasks([TASK])
-        updater.ledger.observe(0, observation())
-        message = updater.ledger.message(0, 1, 0, "I will grab the apple.", "active")
-        planner.generator.return_value = ([json.dumps(
-            planner_output(message.event_id, [message.event_id])
-        )], 0)
-        updater.update({"goal": "put apple on table"})
-        self.assertFalse(hasattr(updater, "commitments"))
-        reliability = updater.state.dimensions["reliability"].value
-        self.assertEqual(reliability["commitment_events"][0]["status"], "pending")
-
-        updater.ledger.observe(1, observation([{"from_id": 2, "to_id": 12,
-                                                "relation_type": "HOLDS_RH"}]))
-        updater.ledger.task_completion(2, TASK, "Bob")
-        state, _ = updater.update({"goal": "put apple on table"})
-        self.assertEqual(state.dimensions["capability"].uncertainty, 0.5)
-        self.assertEqual(
-            state.dimensions["reliability"].value["commitment_events"][0]["status"],
-            "fulfilled",
-        )
-
-    def test_commitment_is_settled_only_by_the_bound_subtask(self):
-        updater, planner = self.make_updater(planner_output())
-        other = dict(TASK, subtask_id="other-apple-task", target_id=21,
-                     target_class="coffeetable")
-        updater.ledger.set_active_tasks([TASK, other])
-        message = updater.ledger.message(
-            0, 1, 0, "I will grab the apple for subtask-apple-table.", "active"
-        )
-        planner.generator.return_value = ([json.dumps(
-            planner_output(message.event_id, [message.event_id])
-        )], 0)
-        updater.update({"goal": "[subtask-apple-table] apple to table"})
-
-        updater.ledger.add(1, "peer_task_progress", {
-            "actor": "Bob", "status": "in_progress", "observed_action": "grab",
-            "task": other,
-        })
-        pending, _ = updater.update({"goal": "two apple tasks"})
-        commitment = pending.dimensions["reliability"].value["commitment_events"][0]
-        self.assertEqual(commitment["subtask_id"], TASK["subtask_id"])
-        self.assertEqual(commitment["status"], "pending")
-
-        updater.ledger.add(2, "peer_task_progress", {
-            "actor": "Bob", "status": "in_progress", "observed_action": "grab",
-            "task": TASK,
-        })
-        fulfilled, _ = updater.update({"goal": "two apple tasks"})
-        commitment = fulfilled.dimensions["reliability"].value["commitment_events"][0]
-        self.assertEqual(commitment["status"], "fulfilled")
-
-    def test_capability_tracks_progress_then_verified_task_success(self):
-        updater, _ = self.make_updater(planner_output())
-        updater.ledger.set_active_tasks([TASK])
-        updater.ledger.observe(0, observation())
-        updater.update({"goal": "put apple on table"})
-        updater.ledger.observe(1, observation([{
-            "from_id": 2, "to_id": 12, "relation_type": "HOLDS_RH",
-        }]))
-
-        progressing, _ = updater.update({"goal": "put apple on table"})
-        capability = progressing.dimensions["capability"].value
-        self.assertIsNone(capability["success_rate"])
-        self.assertEqual(capability["task_execution_events"][0]["status"], "in_progress")
-        self.assertEqual(capability["task_execution_events"][0]["outcome"], "unknown")
-
-        updater.ledger.task_completion(2, TASK, "Bob")
-        completed, _ = updater.update({"goal": "another active task"})
-        capability = completed.dimensions["capability"].value
-        self.assertEqual(capability["success_rate"], 1.0)
-        self.assertEqual(capability["task_execution_events"][0]["status"], "completed")
-        self.assertEqual(capability["task_execution_events"][0]["outcome"], "success")
-
-    def test_repeated_commitment_merges_and_counts_fulfillment_once(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.set_active_tasks([TASK])
-        first = updater.ledger.message(0, 1, 0, 'I will grab the apple.', 'active')
-        second = updater.ledger.message(1, 1, 0, 'I will grab it as agreed.', 'active')
-        answer = planner_output(first.event_id, [first.event_id])
-        answer['commitments'] += planner_output(second.event_id)['commitments']
-        planner.generator.return_value = ([json.dumps(answer)], 0)
-        updater.update()
-        records = updater.state.dimensions['reliability'].value['commitment_events']
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]['acceptance_event_id'], first.event_id)
-        self.assertEqual(records[0]['accepted_step'], 0)
-        self.assertIn(second.event_id, records[0]['evidence_ids'])
-
-        updater.ledger.add(2, 'peer_task_progress', {
-            'task': TASK, 'observed_action': 'grab', 'status': 'in_progress',
-        })
-        state, _ = updater.update()
-        self.assertEqual(state.dimensions['reliability'].value['fulfillments'], 1)
-        third = updater.ledger.message(3, 1, 0, 'As promised, I grabbed it.', 'reply')
-        planner.generator.return_value = ([json.dumps(planner_output(third.event_id))], 0)
-        state, _ = updater.update()
-        value = state.dimensions['reliability'].value
-        self.assertEqual(len(value['commitment_events']), 1)
-        self.assertEqual(value['fulfillments'], 1)
-        self.assertEqual(value['commitment_events'][0]['status'], 'fulfilled')
-
-    def test_old_message_cannot_commit_to_future_subtask_or_fulfill_it(self):
-        updater, _ = self.make_updater(planner_output())
-        task = dict(TASK, subtask_id='S24', created_step=190)
-        old = updater.ledger.message(142, 1, 0, 'Cupcake for the fridge.', 'active')
-        updater.ledger.set_active_tasks([task])
-        proposal = dict(planner_output(old.event_id)['commitments'][0], subtask_id='S24')
-        commitments = {}
-        updater._accept_commitments([proposal], commitments)
-        updater.ledger.add(193, 'peer_task_progress', {'task': task, 'observed_action': 'grab'})
-        updater._settle_commitments(commitments)
-        self.assertEqual(commitments, {})
-
-        valid = updater.ledger.message(190, 1, 0, 'I will handle S24.', 'active')
-        proposal.update(acceptance_event_id=valid.event_id, evidence_ids=[valid.event_id])
-        updater._accept_commitments([proposal], commitments)
-        self.assertEqual(commitments['Bob:S24:grab']['accepted_step'], 190)
-        updater._settle_commitments(commitments)
-        self.assertEqual(commitments['Bob:S24:grab']['status'], 'fulfilled')
-
-        # An older re-extracted declaration must not replace the valid acceptance.
-        proposal.update(acceptance_event_id=old.event_id, evidence_ids=[old.event_id])
-        updater._accept_commitments([proposal], commitments)
-        self.assertEqual(commitments['Bob:S24:grab']['accepted_step'], 190)
-
-    def test_creation_time_survives_task_retirement_and_missing_time_is_rejected(self):
-        updater, _ = self.make_updater(planner_output())
-        task = dict(TASK, subtask_id='S24', created_step=190)
-        updater.ledger.set_active_tasks([task])
-        updater.ledger.task_completion(200, task, 'Bob')
-        updater.ledger.set_active_tasks([])
-        self.assertEqual(updater.ledger.subtask_created_step('S24'), 190)
-        updater.ledger.set_active_tasks([dict(TASK, subtask_id='missing', created_step=None)])
-        message = updater.ledger.message(201, 1, 0, 'I will handle it.', 'active')
-        proposal = dict(planner_output(message.event_id)['commitments'][0], subtask_id='missing')
-        commitments = {}
-        updater._accept_commitments([proposal], commitments)
-        self.assertEqual(commitments, {})
-
-    def test_alice_completion_closes_pending_without_violation(self):
-        updater, planner = self.make_updater(planner_output())
-        updater.ledger.set_active_tasks([TASK])
-        message = updater.ledger.message(0, 1, 0, 'I will grab and place the apple.', 'active')
-        answer = planner_output(message.event_id)
-        answer['commitments'].append(dict(answer['commitments'][0], action='place'))
-        planner.generator.return_value = ([json.dumps(answer)], 0)
-        updater.update()
-        updater.ledger.task_completion(1, TASK, 'Alice')
-        state, _ = updater.update()
-        value = state.dimensions['reliability'].value
-        self.assertEqual(len(value['commitment_events']), 2)
-        self.assertTrue(all(item['status'] == 'closed' and item['outcome'] == 'unknown'
-                            for item in value['commitment_events']))
-        self.assertEqual(value['fulfillments'], 0)
-        self.assertEqual(value['violations'], 0)
-        self.assertIsNone(value['fulfillment_rate'])
-
-    def test_alice_completion_does_not_turn_bob_progress_into_failure(self):
-        updater, _ = self.make_updater(planner_output())
-        updater.ledger.set_active_tasks([TASK])
-        updater.ledger.observe(0, observation())
-        updater.ledger.observe(1, observation([{
-            "from_id": 2, "to_id": 12, "relation_type": "HOLDS_RH",
-        }]))
-        updater.ledger.task_completion(2, TASK, "Alice")
-
-        state, _ = updater.update({"goal": "another active task"})
-
-        capability = state.dimensions["capability"].value
-        execution = capability["task_execution_events"][0]
-        self.assertEqual(execution["status"], "abandoned")
-        self.assertEqual(execution["outcome"], "unknown")
-        self.assertEqual(capability["failures"], 0)
-        self.assertIsNone(capability["success_rate"])
-
-    def test_preference_every_third_call_and_null_rescores_existing_description(self):
-        updater, planner = self.make_updater(planner_output())
-        for index in range(1, 10):
-            answer = planner_output()
-            answer['preference'] = {'description': 'Frequently proposes task divisions.'
-                                    if index <= 3 else None}
-            answer['uncertainty']['preference'] = {3: 0.6, 6: 0.2, 9: 0.4}.get(index, 0.0)
-            planner.generator.return_value = ([json.dumps(answer)], 0)
-            updater.ledger.own_action(index, 'walk')
-            state, record = updater.update({'planner_type': 'reactive' if index % 2 else 'active'})
-            self.assertEqual(record['preference_assessment_due'], index % 3 == 0)
-            if index < 3:
-                self.assertEqual(state.dimensions['preference'].status, 'unknown')
-            else:
-                self.assertEqual(state.dimensions['preference'].value['description'],
-                                 'Frequently proposes task divisions.')
-                expected = 0.6 if index < 6 else 0.2 if index < 9 else 0.4
-                self.assertEqual(state.dimensions['preference'].uncertainty, expected)
-                self.assertEqual(state.dimensions['uncertainty'].value['per_dimension']['preference'], expected)
-        self.assertEqual(planner.generator.call_count, 9)
-        updater.update()
-        self.assertEqual(updater.call_count, 9)
-
-    def test_preference_assessment_keeps_all_intermediate_evidence_and_unknown_score(self):
-        updater, planner = self.make_updater(planner_output())
-        first = updater.ledger.message(0, 1, 0, 'UNIQUE_EARLY_BEHAVIOR', 'active')
-        updater.update()
-        for i in range(25):
-            updater.ledger.message(1, 1, 0, 'Later message {}'.format(i), 'active')
-        updater.update()
-        updater.ledger.own_action(2, 'walk')
-        state, record = updater.update()
-        self.assertIn('UNIQUE_EARLY_BEHAVIOR', record['llm_call']['prompt'])
-        self.assertIn(first.event_id, record['llm_call']['prompt'])
+    def test_private_fields_never_in_prompt_and_preference_disabled(self):
+        u, p = self.make()
+        u.ledger.observe(0, obs())
+        state, record = u.update(info())
+        self.assertNotIn('SECRET', record['llm_call']['prompt'])
         self.assertEqual(state.dimensions['preference'].status, 'unknown')
-        self.assertEqual(state.dimensions['uncertainty'].value['per_dimension']['preference'], 1.0)
+        self.assertEqual(state.dimensions['uncertainty'].value['vector_order'], ['intent', 'capability', 'reliability'])
+        self.assertNotIn('overall', state.dimensions['uncertainty'].value)
+        self.assertIn('probe_intent', render_policy_context(state, u.ledger))
+        self.assertNotIn('<communication_type>', render_reply_context(state, u.ledger))
 
-    def test_policy_context_is_injected_into_existing_planner_prompt(self):
-        planner = LLM.__new__(LLM)
-        planner.prompt_template = "$GOAL\n$PROGRESS\n$STEP\n$ACTION_HISTORY\n$ASSIGNED_PERSONALITY\n$DIALOGUE_HISTORY\n$TRACE_BELIEF\n$ACTIONS_REFINE"
-        planner.goal_desc = "place apple"
-        planner.personality = ""
-        planner.chat = True
-        planner.sampling_params = {"n": 1}
-        planner.total_cost = 0
-        planner.last_usage_metadata = None
-        planner.debug = False
-        planner.oppo_name = "Bob"
-        planner.agent_name = "Alice"
-        planner.get_available_plans = Mock(return_value=("", "A. [goexplore]", [], ["[goexplore]"], 1))
-        planner.generator = Mock(return_value=(["<action>A. [goexplore]</action>"], 0))
-        planner.parse_answer = Mock(return_value=("[goexplore] <kitchen> (11)", "", None))
-        planner.progress2text = Mock(return_value="none")
-        _, info = planner.run(None, {}, [], [], {}, {}, None, [], [], [], None,
-                              belief_context="TRACE_TEST_CONTEXT")
-        self.assertIn("TRACE_TEST_CONTEXT", info["raw_prompt"])
-        self.assertEqual(info["trace_belief_context"], "TRACE_TEST_CONTEXT")
-        self.assertEqual(info["shared_information"]["goal"], "place apple")
+    def test_invalid_llm_output_retains_aligned_prior(self):
+        u, p = self.make()
+        u.ledger.observe(0, obs())
+        u.update(info())
+        old = copy.deepcopy(u.intent)
+        p.generator.return_value = (['not json'], 0)
+        _, record = u.update(info(1))
+        self.assertEqual(record['intent_update_status'], 'retained_prior')
+        self.assertEqual(u.intent['joint'], old['joint'])
+        self.assertEqual(record['llm_call']['raw_output'], 'not json')
+
+    def test_task_retirement_and_new_task_have_valid_mass(self):
+        old = uniform(candidates({'S1': TASK}))
+        support = candidates({'S2': dict(TASK, subtask_id='S2')})
+        aligned = align_prior(old, support)
+        self.assertNotIn('S1', aligned['task_probs'])
+        self.assertGreater(aligned['task_probs']['S2'], 0)
+        self.assertAlmostEqual(sum(x['probability'] for x in aligned['joint']), 1)
+
+    def test_delegation_settles_only_public_completion_and_counts_once(self):
+        for actor, expected in [('Bob', 2/3), ('Alice', 1/3), ('unknown', 0.5)]:
+            with self.subTest(actor=actor):
+                u, p = self.make()
+                accepted = self.delegate(u)
+                self.answer(u, p, [accepted])
+                u.update(info())
+                self.assertEqual(u.commitments['S1']['status'], 'pending')
+                u.ledger.add(1, 'peer_task_progress', {'task': TASK, 'observed_action': 'grab'})
+                u.update(info(1))
+                self.assertEqual(u.commitments['S1']['status'], 'pending')
+                u.ledger.task_completion(2, TASK, actor)
+                state, _ = u.update(info(2))
+                self.assertAlmostEqual(state.dimensions['reliability'].value['mean'], expected)
+                stats = state.dimensions['reliability'].value
+                u.update(info(3))
+                self.assertEqual(u.state.dimensions['reliability'].value, stats)
+
+    def test_probe_unsolicited_claim_and_unlinked_reply_do_not_create_commitments(self):
+        u, p = self.make()
+        proposal = self.delegate(u, 'probe_intent')
+        self.answer(u, p, [proposal])
+        state, _ = u.update(info())
+        self.assertEqual(u.commitments, {})
+        self.assertEqual(len(state.dimensions['intent'].value['probe_context']), 1)
+        u.receive_message(message(1, 'I will complete S1'))
+        u.update(info(1))
+        self.assertEqual(u.commitments, {})
+        u2, p2 = self.make()
+        proposal = self.delegate(u2)
+        proposal['reply_event_id'] = proposal['request_event_id']
+        self.answer(u2, p2, [proposal])
+        u2.update(info())
+        self.assertEqual(u2.commitments, {})
+
+    def test_reject_and_unclear_do_not_count_as_failures(self):
+        for response in ('rejected', 'unclear'):
+            u, p = self.make()
+            proposal = self.delegate(u)
+            proposal['response'] = response
+            self.answer(u, p, [proposal])
+            u.update(info())
+            u.ledger.task_completion(1, TASK, 'Alice')
+            state, _ = u.update(info(1))
+            self.assertEqual(state.dimensions['reliability'].value['failures'], 0)
+
+    def test_capability_alice_completion_unknown_bob_completion_success(self):
+        for actor, expected in [('Alice', 0.5), ('Bob', 2/3)]:
+            u, p = self.make()
+            u.ledger.observe(0, obs())
+            u.ledger.observe(1, obs(holds=True))
+            u.ledger.task_completion(2, TASK, actor)
+            state, _ = u.update(info(2))
+            self.assertAlmostEqual(state.dimensions['capability'].value['mean'], expected)
+            self.assertEqual(state.dimensions['capability'].value['failures'], 0)
+
+    def test_visibility_reentry_is_not_fresh_grab(self):
+        u, _ = self.make()
+        u.ledger.observe(0, obs(bob=False))
+        u.ledger.observe(1, obs(holds=True))
+        self.assertFalse(any(e.kind == 'peer_task_progress' for e in u.ledger.events))
+
+    def test_explicit_terminal_failure_and_pending_episode_are_distinct(self):
+        u, p = self.make()
+        u.ledger.add(0, 'peer_task_outcome', {'task': TASK, 'verified': True,
+                     'terminal': True, 'success': False})
+        state, _ = u.update(info())
+        self.assertEqual(state.dimensions['capability'].value['failures'], 0)
+        self.assertAlmostEqual(state.dimensions['capability'].value['mean'], 0.5)
+        u, p = self.make()
+        proposal = self.delegate(u)
+        self.answer(u, p, [proposal])
+        u.update(info())
+        state, _ = u.update(info(1000))
+        self.assertEqual(u.commitments['S1']['status'], 'pending')
+        self.assertEqual(state.dimensions['reliability'].value['failures'], 0)
+
+    def test_repeated_accepted_delegation_does_not_duplicate_responsibility(self):
+        u, p = self.make()
+        proposal = self.delegate(u)
+        self.answer(u, p, [proposal])
+        u.update(info())
+        proposal = self.delegate(u)
+        self.answer(u, p, [proposal])
+        u.update(info())
+        self.assertEqual(len(u.commitments), 1)
+        u.ledger.task_completion(1, TASK, 'Bob')
+        state, _ = u.update(info(1))
+        self.assertEqual(state.dimensions['reliability'].value['successes'], 1)
+
+    def test_late_unrelated_reply_cannot_attach_to_old_failed_delivery(self):
+        u, _ = self.make()
+        u.stage_communication({'type': 'delegate', 'subtask_id': 'S1'})
+        u.receive_message(message(0, 'Please complete S1', step=0))
+        reply = u.receive_message(message(1, 'Yes', 'reply', step=5, parent_sender=0))
+        self.assertIsNone(reply.payload['reply_to'])
+
+    def test_joint_distribution_can_express_task_skill_dependency(self):
+        support = candidates({'S1': TASK, 'S2': dict(TASK, subtask_id='S2')})
+        rows = {t: dict.fromkeys(skills, 0) for t, skills in support.items()}
+        rows['S1']['gograb'] = 1
+        rows['S2']['goput'] = 1
+        rows['none']['idle'] = 1
+        dist = distribution({'S1': 0.6, 'S2': 0.4, 'none': 0}, rows, support)
+        joint = {(x['subtask_id'], x['skill']): x['probability'] for x in dist['joint']}
+        self.assertEqual(joint['S1', 'goput'], 0)
+        self.assertEqual(joint['S1', 'gograb'], 0.6)
+        self.assertAlmostEqual(dist['conditional_skill_entropy'], 0)
 
 
-if __name__ == "__main__":
+
+    def test_acceptance_can_recover_after_invalid_generation(self):
+        u, p = self.make()
+        proposal = self.delegate(u)
+        p.generator.return_value = (['bad json'], 0)
+        u.update(info())
+        self.assertFalse(u.commitments)
+        self.answer(u, p, [proposal])
+        _, record = u.update(info(1))
+        self.assertIn('I accept S1', record['llm_call']['prompt'])
+        self.assertEqual(u.commitments['S1']['status'], 'pending')
+
+
+if __name__ == '__main__':
     unittest.main()

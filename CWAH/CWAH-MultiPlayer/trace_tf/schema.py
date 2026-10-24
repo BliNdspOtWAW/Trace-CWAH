@@ -82,3 +82,14 @@ DEFAULT_SCHEMA = BeliefSchema.define(
         DimensionSpec("uncertainty", "Mean of intent, capability, preference and reliability uncertainty; 0 certain, 1 unknown", "variable"),
     ),
 )
+
+
+V2_SCHEMA = BeliefSchema.define(
+    "trace-v2-joint-intent-beta",
+    tuple(DimensionSpec(d.name, {
+        'intent': 'Dynamic joint public-subtask/current-skill distribution',
+        'capability': 'Global Beta posterior for observed task execution success',
+        'reliability': 'Beta posterior for accepted delegation completion by Bob',
+        'preference': 'Disabled in v2',
+        'uncertainty': 'Vector: normalized intent entropy, 12*capability variance, 12*reliability variance',
+    }.get(d.name, d.description), d.timescale) for d in DEFAULT_SCHEMA.dimensions))

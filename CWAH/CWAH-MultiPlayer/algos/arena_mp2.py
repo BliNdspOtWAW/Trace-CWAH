@@ -505,7 +505,7 @@ class ArenaMP(object):
             snapshot['trace'] = {
                 'evidence_events': [event.to_dict() for event in trace.ledger.events],
                 'belief_updates': trace.update_log,
-                'final_belief': trace.state.to_dict(),
+                **trace.archive_fields(),
                 'updater_calls': len(calls),
                 'updater_token_usage': {
                     key: sum((call.get('usage') or {}).get(key) or 0 for call in calls)
@@ -658,7 +658,7 @@ class ArenaMP(object):
             saved_info['trace'] = {
                 "evidence_events": [event.to_dict() for event in trace.ledger.events],
                 "belief_updates": trace.update_log,
-                "final_belief": trace.state.to_dict(),
+                **trace.archive_fields(),
                 "updater_calls": len(updater_calls),
                 "updater_calls_with_reported_usage": sum(call.get('usage') is not None for call in updater_calls),
                 "updater_token_usage": {

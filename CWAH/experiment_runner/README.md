@@ -24,7 +24,7 @@ env 的默认模型，切换供应商时也要选择匹配的实验 JSON。
 旧 `scripts/env.local.sh`（DS）和 `scripts/env.jd.sh`（JD）仍可使用，内部
 转到此统一入口；不要在 shell 开启 `set -x` 时加载密钥文件。
 
-这里的任务来自原始 WAH 候选数据，**不是 CollabBench 论文 Task 26 的严格复现**。任务与 Bob 画像分开选择：`episode_index` 选择 WAH Episode；`bob_profile.text_file` 直接读取画像文本，不根据 Task ID 做任何映射。Alice 不加载画像。`profiles/peer{8,17,23,24}.txt` 是从旧 CollabBench `26_prepare_food` 画像表复制的文本，供迁移实验使用；它们不是 WAH 原生画像。也可以换成自己的 UTF-8 文本文件，或把 `bob_profile` 设为 `null`（无画像）。
+这里的任务来自原始 WAH 候选数据，**不是 CollabBench 论文 Task 26 的严格复现**。任务与 Bob 画像分开选择：`episode_index` 选择 WAH Episode；`bob_profile.text_file` 直接读取画像文本，不根据 Task ID 做任何映射。Alice 不加载画像。`profiles/tracev1/peer{8,17,23,24}.txt` 是从旧 CollabBench `26_prepare_food` 画像表复制的文本，供迁移实验使用；它们不是 WAH 原生画像。也可以换成自己的 UTF-8 文本文件，或把 `bob_profile` 设为 `null`（无画像）。
 
 ## 第一次配置
 
@@ -144,3 +144,36 @@ TRACE-on 的 Alice 在回复 Bob 前先将新消息写入 Evidence Ledger 并更
 TRACE-off 时两名 Agent 都只使用 Goal、Personality、合法观察、任务进度、
 Action History 和 Dialogue History。每条成功处理的主动消息必须产生一次回复，
 模型格式错误或 API 异常会记录为 `reply_error`，不再作为主动沉默处理。
+
+## Versioned results root
+
+Set results_root to CWAH/experiments/tracev2 in an experiment JSON to write
+TRACE-on runs under tracev2/trace/ and TRACE-off runs under tracev2/baseline/.
+The runner validates that the resolved root stays within this project CWAH/experiments/ directory.
+The default remains unchanged for old configs. --check prints the resolved root
+and does not start Unity or load a model.
+
+
+## Offline retrospective Intent agreement
+
+Independent entry: compare_intent_posteriors.py prepare / infer / report.
+See [protocol, commands and output files](../../docs/OFFLINE_INTENT_AGREEMENT.md).
+The analysis compares likelihood-times-prior and direct-LLM posteriors over the
+same starting decision using full-support base-2 JSD. It does not change online
+TRACE, require ground truth, train a model, or measure accuracy.
+
+
+## Maintained documentation and versioned profiles
+
+- Online TRACE v2: ../../docs/TRACE_V2.md
+- Offline posterior agreement: ../../docs/OFFLINE_INTENT_AGREEMENT.md
+- Task execution/communication: ../../docs/CWAH_TASK_CONTROL.md
+- Local Qwen backend: ../../docs/QWEN3_LOCAL.md
+- Model-call metrics: ../../docs/LLM_METRICS.md
+
+Historical peer profiles are in profiles/tracev1. New behavior profiles are in
+profiles/tracev2. Configurations select a concrete UTF-8 profile explicitly;
+moving profile files does not automatically select a different behavior.
+TRACE v2 experiment templates are in configs/tracev2; copy .json.example to
+ignored local .json before editing/running. Historical commit records live under
+commit-records/trace-v1 and current implementation notes under trace-v2.

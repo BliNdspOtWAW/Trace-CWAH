@@ -1,37 +1,29 @@
-"""One-call hybrid updater: legal history, LLM interpretation, rule settlement."""
-
+"""Decision-coupled TRACE v2: joint intent, Beta statistics, typed communication."""
 import json
 import re
-import time
 from pathlib import Path
-
 from .events import EvidenceLedger
 from .model import BeliefState, Evidence, EvidenceSource
+from .schema import V2_SCHEMA
+from .peer_observation import observe_peer
+from .probability import candidates, distribution, align_prior, beta_stats
 from LLM.telemetry import measured_generate
 
-
-PROMPT = Path(__file__).with_name("prompt_Updater.txt").read_text(encoding="utf-8")
-SCORED = ("intent", "capability", "preference", "reliability")
-ACTIONS = {"goexplore", "gocheck", "gograb", "goput", "send_message"}
-
-
-def _unit(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
-        return 1.0
-    return float(value)
+PROMPT = Path(__file__).with_name('prompt_Updater.txt').read_text(encoding='utf-8')
 
 
 class HybridUpdater:
     def __init__(self, planner, teammate_id=2):
         self.planner = planner
         self.ledger = EvidenceLedger(target_id=1, peer_id=teammate_id)
-        self.state = BeliefState(teammate_id)
+        self.state = BeliefState(teammate_id, V2_SCHEMA)
         self.cursor = 0
         self.update_log = []
-        self.last_context = ""
         self.call_count = 0
-        self.preference_cursor = 0
-        self.preference_due = False
+        self.intent = None
+        self.pending_outgoing = None
+        self.requests = {}
+        self.commitments = {}
 
     def _evidence(self, events):
         evidence = []
@@ -64,235 +56,21 @@ class HybridUpdater:
         for event in events:
             payload = event.payload
             if event.kind == "observation":
-                nodes = {node["id"]: node for node in payload["nodes"]}
+                peer = observe_peer(payload, self.ledger.target_id, self.ledger.peer_id, event.step)
                 facts = []
-                for edge in payload["edges"]:
-                    if edge["from_id"] != self.ledger.peer_id:
-                        continue
-                    target = nodes.get(edge["to_id"], {})
-                    relation = edge["relation_type"]
-                    if relation in ("HOLDS_RH", "HOLDS_LH"):
-                        facts.append("Bob visibly holds <{}> ({})".format(
-                            target.get("class_name", "object"), edge["to_id"]
-                        ))
-                    elif relation == "INSIDE" and target.get("category") == "Rooms":
-                        facts.append("Bob is visibly in the {}".format(target.get("class_name")))
-                payload = {"semantic_peer_facts": facts or ["Bob is not currently visible"]}
+                if peer['visible']:
+                    facts.append('Bob is visible in this partial observation')
+                    state = peer['state']
+                    if state['room'] is not None:
+                        facts.append('Bob is visibly in the ' + str(state['room']['class_name']))
+                    facts.extend('Bob visibly holds <{}> ({})'.format(obj['class_name'], obj['id'])
+                                 for obj in state['observed_held_objects'])
+                else:
+                    facts.append('Bob is not currently visible; current room and holdings are unknown')
+                payload = {'peer_observation': peer, 'semantic_peer_facts': facts}
             result.append({"event_id": event.event_id, "step": event.step,
                            "kind": event.kind, "payload": payload})
         return result
-
-    def _compact_prior(self):
-        result = {}
-        for name, item in self.state.dimensions.items():
-            if name in ("information", "uncertainty"):
-                continue
-            result[name] = {
-                "status": item.status,
-                "value": item.value,
-                "uncertainty": item.uncertainty,
-                "recent_evidence_ids": [e.reference for e in item.evidence[-8:]],
-            }
-        return result
-
-    def _infer(self, information):
-        # The ledger remains complete for audit. Inference receives the exact legal
-        # Information snapshot shared with the planner plus compact Bob evidence.
-        observations = [e for e in self.ledger.events if e.kind == "observation"]
-        selected = [e for e in self.ledger.events
-                    if e.kind in ("message", "peer_task_progress", "peer_task_outcome",
-                                  "task_completion")][-20:]
-        if observations:
-            selected.append(observations[-1])
-        selected.sort(key=lambda e: int(e.event_id[1:]))
-        self.call_count += 1
-        self.preference_due = self.call_count % 3 == 0
-        preference_events = self.ledger.since(self.preference_cursor)
-        preference_instruction = (
-            'Evaluate Preference this call using the prior description and uncertainty. '
-            'New legal behavior since the previous Preference assessment: '
-            + json.dumps(self._prompt_events(preference_events), ensure_ascii=False)
-            if self.preference_due else
-            'Do not evaluate Preference this call. Omit preference and '
-            'uncertainty.preference; the runtime retains both previous values.'
-        )
-        information_json = json.dumps(information, ensure_ascii=False)
-        prior_json = json.dumps(self._compact_prior(), ensure_ascii=False)
-        events_json = json.dumps(self._prompt_events(selected), ensure_ascii=False)
-        prompt = PROMPT.replace("$INFORMATION", information_json)
-        prompt = prompt.replace("$BELIEF", prior_json)
-        prompt = prompt.replace("$EVENTS", events_json)
-        prompt = prompt.replace("$PREFERENCE_ASSESSMENT", preference_instruction)
-        sampling = self.planner.sampling_params
-        params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
-        params["n"] = 1
-        params["temperature"] = 0
-        limit_key = "max_tokens" if self.planner.chat else "max_new_tokens"
-        params[limit_key] = min(params.get(limit_key, 768), 768)
-        request = [{"role": "user", "content": prompt}] if self.planner.chat else prompt
-        started = time.monotonic()
-        outputs, legacy_cost = measured_generate(
-            self.planner, request, params, 'updater', information,
-            sections={'information': information_json, 'prior_belief': prior_json,
-                      'events': events_json, 'preference_assessment': preference_instruction,
-                      'dialogue_history': information.get('dialogue_history', []),
-                      'action_history': information.get('action_history', [])},
-            counts={'ledger_events': len(self.ledger.events), 'selected_events': len(selected),
-                    'preference_events': len(preference_events),
-                    'preference_due': int(self.preference_due)})
-        latency = time.monotonic() - started
-        raw = outputs[0] if outputs else ""
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.I | re.S)
-        data = json.loads(match.group(1) if match else raw.strip())
-        if not isinstance(data, dict):
-            raise ValueError("updater output must be an object")
-        return data, {"model": self.planner.lm_id, "usage": self.planner.last_usage_metadata,
-                      "legacy_cost_estimate": legacy_cost, "latency_seconds": latency,
-                      "prompt": prompt, "raw_output": raw}
-
-    def _valid_events(self, ids):
-        by_id = self.ledger.by_id()
-        if not isinstance(ids, list) or not all(isinstance(i, str) and i in by_id for i in ids):
-            return []
-        return [by_id[i] for i in dict.fromkeys(ids)]
-
-    def _peer_evidence(self, events):
-        """Alice's own request alone cannot establish Bob's intent/preference."""
-        result = []
-        for event in events:
-            if event.kind == "message" and event.payload["sender"] == 2:
-                result.append(event)
-            elif event.kind in ("peer_task_progress", "peer_task_outcome"):
-                result.append(event)
-            elif event.kind == "task_completion" and event.payload.get("completed_by") == "Bob":
-                result.append(event)
-            elif event.kind == "observation" and any(
-                node["id"] == 2 for node in event.payload["nodes"]
-            ):
-                result.append(event)
-        return result
-
-    def _commitments_from_reliability(self):
-        reliability = self.state.dimensions["reliability"]
-        if reliability.status != "supported" or not isinstance(reliability.value, dict):
-            return {}
-        return {
-            item["commitment_id"]: json.loads(json.dumps(item))
-            for item in reliability.value.get("commitment_events", [])
-            if isinstance(item, dict) and item.get("commitment_id")
-        }
-
-    def _accept_commitments(self, proposals, commitments):
-        if not isinstance(proposals, list):
-            return
-        by_id = self.ledger.by_id()
-        for item in proposals:
-            if not isinstance(item, dict):
-                continue
-            key = item.get("acceptance_event_id")
-            accepted = by_id.get(key)
-            action = item.get("action")
-            obj = item.get("object")
-            subtask_id = item.get("subtask_id")
-            if (not accepted or accepted.kind != "message" or accepted.payload["sender"] != 2
-                    or action not in ("grab", "place", "search")
-                    or (obj is not None and not isinstance(obj, str))
-                    or (action in ("grab", "place")
-                        and subtask_id not in self.ledger.known_subtask_ids())
-                    or (action == "search" and subtask_id is not None
-                        and subtask_id not in self.ledger.known_subtask_ids())
-                    or not self._valid_events(item.get("evidence_ids", []))):
-                continue
-            if subtask_id is not None:
-                created_step = self.ledger.subtask_created_step(subtask_id)
-                # An older message cannot commit to a future task. Unknown
-                # creation time cannot justify accepting that association.
-                if created_step is None or accepted.step < created_step:
-                    continue
-            # A concrete responsibility survives repeated confirmations. Unbound
-            # searches have no task identity, so keep their message identity.
-            commitment_id = "Bob:{}:{}".format(subtask_id or key, action)
-            proposed = item.get("proposed_status")
-            if proposed not in ("pending", "fulfilled", "violated", "unverifiable"):
-                proposed = "unverifiable"
-            if commitment_id not in commitments:
-                commitments[commitment_id] = {
-                    "commitment_id": commitment_id, "acceptance_event_id": key,
-                    "subtask_id": subtask_id, "action": action, "object": obj,
-                    "actor": "Bob", "accepted_step": accepted.step,
-                    "status": "pending", "outcome": "unknown",
-                    "evidence_ids": [key], "llm_proposed_status": proposed,
-                    "llm_evidence_ids": list(dict.fromkeys(item["evidence_ids"])),
-                }
-            else:
-                existing = commitments[commitment_id]
-                earliest = by_id[existing["acceptance_event_id"]]
-                if int(accepted.event_id[1:]) < int(earliest.event_id[1:]):
-                    existing["acceptance_event_id"] = key
-                    existing["accepted_step"] = accepted.step
-                existing["evidence_ids"] = list(dict.fromkeys(
-                    existing["evidence_ids"] + [key]
-                ))
-                existing["llm_proposed_status"] = proposed
-                existing["llm_evidence_ids"] = list(dict.fromkeys(
-                    existing.get("llm_evidence_ids", []) + item["evidence_ids"]
-                ))
-
-    def _settle_commitments(self, commitments):
-        for commitment in commitments.values():
-            if commitment["status"] != "pending":
-                continue
-            accepted_step = self.ledger.by_id()[commitment["acceptance_event_id"]].step
-            for event in self.ledger.events:
-                outcome = event.payload
-                if event.step < accepted_step:
-                    continue
-                if (event.kind == "task_completion"
-                        and (outcome.get("task") or {}).get("subtask_id")
-                        == commitment.get("subtask_id")
-                        and outcome.get("completed_by") == "Alice"):
-                    commitment.update({
-                        "status": "closed", "outcome": "unknown",
-                        "closure_reason": "completed_by_Alice",
-                        "settlement_event_id": event.event_id,
-                    })
-                    commitment["evidence_ids"].append(event.event_id)
-                    break
-                matched = False
-                if event.kind == "peer_task_progress":
-                    task = outcome.get("task") or {}
-                    matched = (
-                        commitment["action"] == "grab"
-                        and task.get("subtask_id") == commitment.get("subtask_id")
-                    )
-                elif event.kind == "peer_task_outcome":
-                    task = outcome.get("task") or {}
-                    matched = (
-                        outcome.get("verified")
-                        and outcome.get("action") == commitment["action"]
-                        and task.get("subtask_id") == commitment.get("subtask_id")
-                    )
-                elif event.kind == "task_completion" and outcome.get("completed_by") == "Bob":
-                    task = outcome.get("task") or {}
-                    matched = (
-                        commitment["action"] == "place"
-                        and task.get("subtask_id") == commitment.get("subtask_id")
-                    )
-                if not matched:
-                    continue
-                if event.kind in ("peer_task_progress", "task_completion"):
-                    commitment["status"] = "fulfilled"
-                elif outcome.get("success") is True:
-                    commitment["status"] = "fulfilled"
-                elif outcome.get("success") is False and outcome.get("terminal") is True:
-                    commitment["status"] = "violated"
-                if commitment["status"] != "pending":
-                    commitment["outcome"] = (
-                        "success" if commitment["status"] == "fulfilled" else "failure"
-                    )
-                    commitment["settlement_event_id"] = event.event_id
-                    commitment["evidence_ids"].append(event.event_id)
-                    break
 
     def _capability_executions(self):
         """Build task-level Bob execution records from legal progress/completion evidence."""
@@ -331,120 +109,225 @@ class HybridUpdater:
                     item["evidence_ids"].append(event.event_id)
         return executions
 
+    def stage_communication(self, metadata):
+        self.pending_outgoing = dict(metadata)
+
+    def receive_message(self, event):
+        metadata = None
+        if event['sender'] == 0 and event['kind'] == 'active':
+            metadata, self.pending_outgoing = self.pending_outgoing, None
+        reply_to = None
+        if event['sender'] == 1 and event['kind'] == 'reply' and event.get('parent_sender') == 0:
+            unanswered = [r for r in self.requests.values() if not r.get('reply_event_id')
+                          and r['requested_step'] == event['step']]
+            if unanswered:
+                reply_to = unanswered[-1]['request_event_id']
+        item = self.ledger.message(event['step'], event['sender'], event['receiver'],
+                                   event['text'], event['kind'], metadata, reply_to)
+        if metadata:
+            self.requests[item.event_id] = dict(metadata, request_event_id=item.event_id,
+                                               requested_step=item.step, status='requested')
+        if reply_to:
+            self.requests[reply_to]['reply_event_id'] = item.event_id
+        return item
+
+    def _accept_replies(self, proposals):
+        if not isinstance(proposals, list):
+            return
+        by_id = self.ledger.by_id()
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                continue
+            request = self.requests.get(proposal.get('request_event_id'))
+            if not request or request['type'] != 'delegate' or request['status'] != 'requested':
+                continue
+            reply_id = proposal.get('reply_event_id')
+            reply = by_id.get(reply_id)
+            if (reply_id != request.get('reply_event_id') or not reply
+                    or reply.payload.get('sender') != self.ledger.peer_id
+                    or reply.payload.get('reply_to') != request['request_event_id']):
+                continue
+            response = proposal.get('response')
+            if response not in ('accepted', 'rejected', 'unclear'):
+                continue
+            request['status'] = response
+            request['classified_step'] = reply.step
+            if response != 'accepted':
+                continue
+            task_id = request['subtask_id']
+            created = self.ledger.subtask_created_step(task_id)
+            if created is None or reply.step < created:
+                request['status'] = 'unclear'
+                continue
+            # One responsibility per concrete task; repeat requests never inflate counts.
+            self.commitments.setdefault(task_id, {
+                'commitment_id': 'Bob:' + task_id, 'subtask_id': task_id,
+                'request_event_id': request['request_event_id'],
+                'acceptance_event_id': reply_id, 'accepted_step': reply.step,
+                'started_step': None, 'completed_step': None,
+                'status': 'pending', 'outcome': 'unknown',
+                'evidence_ids': [request['request_event_id'], reply_id]})
+
+    def _settle_commitments(self, commitments=None):
+        for item in (self.commitments if commitments is None else commitments).values():
+            if item['status'] != 'pending':
+                continue
+            accepted_index = int(item['acceptance_event_id'][1:])
+            for event in self.ledger.events:
+                if int(event.event_id[1:]) <= accepted_index:
+                    continue
+                if (event.payload.get('task') or {}).get('subtask_id') != item['subtask_id']:
+                    continue
+                if event.kind == 'peer_task_progress' and item['started_step'] is None:
+                    item['started_step'] = event.step
+                if event.kind != 'task_completion':
+                    continue
+                actor = event.payload.get('completed_by', 'unknown')
+                item.update(completed_step=event.step, settlement_event_id=event.event_id,
+                            status='fulfilled' if actor == 'Bob' else
+                                   'violated' if actor == 'Alice' else 'unverifiable',
+                            outcome='success' if actor == 'Bob' else
+                                    'failure' if actor == 'Alice' else 'unknown')
+                item['evidence_ids'].append(event.event_id)
+                break
+
+    def rule_statistics(self):
+        """Settle a detached rule-only view, without a model call or decision."""
+        executions = self._capability_executions()
+        capability = beta_stats(sum(e['outcome'] == 'success' for e in executions.values()), 0)
+        capability['task_execution_events'] = list(executions.values())
+        commitments = json.loads(json.dumps(self.commitments))
+        self._settle_commitments(commitments)
+        reliability = beta_stats(sum(e['outcome'] == 'success' for e in commitments.values()),
+                                 sum(e['outcome'] == 'failure' for e in commitments.values()))
+        reliability['commitment_events'] = list(commitments.values())
+        reliability['communication_requests'] = json.loads(json.dumps(list(self.requests.values())))
+        return {'capability': capability, 'reliability': reliability,
+                'through_event_count': len(self.ledger.events),
+                'through_environment_step': max((e.step for e in self.ledger.events), default=None),
+                'unclassified_delegate_reply_ids': [r['reply_event_id'] for r in self.requests.values()
+                    if r['type'] == 'delegate' and r['status'] == 'requested' and r.get('reply_event_id')]}
+
+    def archive_fields(self):
+        """No side effects: final rules include the tail; Intent keeps its boundary."""
+        last = self.state.to_dict()
+        return {'last_decision_belief': last,
+                'last_decision_id': self.call_count or None,
+                'last_decision_environment_step': self.update_log[-1]['environment_step'] if self.update_log else None,
+                'final_rule_statistics': self.rule_statistics(),
+                'unconsumed_intent_events': [e.to_dict() for e in self.ledger.since(self.cursor)],
+                'intent_event_cursor': self.cursor,
+                'final_belief': json.loads(json.dumps(last)),
+                'final_belief_semantics': 'legacy_alias_of_last_decision_belief'}
+
+    def _infer(self, information, prior, support, new):
+        # Retryable acceptance parsing: linked reply text remains available even
+        # after an earlier generation/JSON failure consumed its decision interval.
+        by_id = self.ledger.by_id()
+        requests = []
+        for request in self.requests.values():
+            item = dict(request)
+            for field in ('request_event_id', 'reply_event_id'):
+                event = by_id.get(request.get(field))
+                if event is not None:
+                    item[field.replace('_id', '_text')] = event.payload['text']
+            requests.append(item)
+        values = {'$INFORMATION': information, '$PRIOR': prior, '$SUPPORT': support,
+                  '$EVENTS': self._prompt_events(new), '$REQUESTS': requests}
+        prompt = PROMPT
+        for key, value in values.items():
+            prompt = prompt.replace(key, json.dumps(value, ensure_ascii=False))
+        sampling = self.planner.sampling_params
+        params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
+        params['n' if self.planner.chat else 'num_return_sequences'] = 1
+        params['temperature'] = 0
+        params['max_tokens' if self.planner.chat else 'max_new_tokens'] = max(1536, 100 * len(support))
+        request = [{'role': 'user', 'content': prompt}] if self.planner.chat else prompt
+        outputs, cost = measured_generate(self.planner, request, params, 'updater', information,
+            sections={'information': values['$INFORMATION'], 'prior_belief': prior,
+                      'events': values['$EVENTS'], 'communication_requests': values['$REQUESTS']},
+            counts={'new_events': len(new), 'decision_id': self.call_count})
+        raw = outputs[0] if outputs else ''
+        call = {'model': self.planner.lm_id, 'prompt': prompt, 'raw_output': raw,
+                'usage': self.planner.last_usage_metadata, 'legacy_cost_estimate': cost}
+        try:
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
+            data = json.loads(cleaned)
+            if not isinstance(data, dict):
+                raise ValueError('updater output must be an object')
+        except Exception as exc:
+            call['error'] = str(exc)
+            return {}, call
+        return data, call
+
     def update(self, information=None):
+        # Invoked exclusively at Active/Reactive planner boundaries, never by observe().
         new = self.ledger.since(self.cursor)
-        if not new:
+        if information is None and not new:
             return self.state, None
         before = self.state.to_dict()
-        self.cursor = len(self.ledger.events)
-        if information is None:
-            information = {"event_ids": [e.event_id for e in self.ledger.events],
-                           "event_count": len(self.ledger.events)}
-        else:
-            information = json.loads(json.dumps(information))
-            information["evidence_event_count"] = len(self.ledger.events)
-        self._apply("information", information, 0.0, new)
-
+        start_cursor = self.cursor
+        information = json.loads(json.dumps(information or {
+            'event_ids': [e.event_id for e in self.ledger.events]}))
+        information['evidence_event_count'] = len(self.ledger.events)
+        self.call_count += 1
+        # A decision provenance record also allows same-environment-step decisions
+        # with no new observation to update the immutable belief model.
+        boundary = self.ledger.add(information.get('step', 0), 'decision', {
+            'decision_id': self.call_count, 'planner_type': information.get('planner_type', 'unknown')})
+        provenance = new + [boundary]
+        tasks = information.get('public_tasks')
+        if tasks is None:
+            tasks = {t['subtask_id']: t for t in self.ledger._active_tasks}
+        support = candidates(tasks)
+        previous = self.intent
+        prior = align_prior(previous, support)
+        self._apply('information', information, 0.0, provenance)
         call = None
         inference = {}
         try:
-            inference, call = self._infer(information)
+            inference, call = self._infer(information, prior, support, new)
         except Exception as exc:
-            call = {"error": "{}: {}".format(type(exc).__name__, exc),
-                    "model": self.planner.lm_id, "usage": self.planner.last_usage_metadata}
-
-        commitments = self._commitments_from_reliability()
-        self._accept_commitments(inference.get("commitments", []), commitments)
-        self._settle_commitments(commitments)
-        proposals = inference.get("uncertainty", {})
-        if not isinstance(proposals, dict):
-            proposals = {}
-        uncertainties = {}
-
-        for dimension in ("intent",):
-            entry = inference.get(dimension, {})
-            entry = entry if isinstance(entry, dict) else {}
-            events = self._peer_evidence(self._valid_events(entry.get("evidence_ids", [])))
-            value = entry.get("action")
-            if value not in ACTIONS:
-                value = None
-            if value is not None and events:
-                floor = 1.0 / (len(events) + 1)
-                u = max(_unit(proposals.get(dimension)), floor)
-                detail = {"action": value, "target": entry.get("target")}
-                self._apply(dimension, detail, u, events)
-                uncertainties[dimension] = u
-            else:
-                if dimension == "intent" and self.state.dimensions[dimension].status == "supported":
-                    prior_refs = {e.reference for e in self.state.dimensions[dimension].evidence}
-                    withdrawal = [e for e in self._evidence(new) if e.reference not in prior_refs]
-                    if withdrawal:
-                        self.state = self.state.with_unknown("intent", withdrawal)
-                prior = self.state.dimensions[dimension]
-                uncertainties[dimension] = 1.0 if prior.status == "unknown" or prior.uncertainty is None else prior.uncertainty
-
-        prior = self.state.dimensions['preference']
-        entry = inference.get('preference')
-        if (self.preference_due and isinstance(entry, dict)
-                and 'description' in entry and 'preference' in proposals):
-            description = entry.get('description')
-            if isinstance(description, str) and description.strip():
-                value = {'description': description.strip()}
-            else:
-                value = prior.value if prior.status == 'supported' else None
-            if value is not None:
-                u = _unit(proposals.get('preference'))
-                # Attach input provenance for audit, without asking the model
-                # for evidence IDs or gating acceptance on peer-event counts.
-                self._apply('preference', value, u,
-                            self.ledger.since(self.preference_cursor))
-            self.preference_cursor = len(self.ledger.events)
-        preference = self.state.dimensions['preference']
-        uncertainties['preference'] = (
-            preference.uncertainty if preference.status == 'supported'
-            and preference.uncertainty is not None else 1.0
-        )
-
+            call = {'error': '{}: {}'.format(type(exc).__name__, exc), 'model': self.planner.lm_id}
+        self._accept_replies(inference.get('delegation_responses', []))
+        self._settle_commitments()
+        try:
+            entry = inference['intent']
+            posterior = distribution(entry['task_probs'], entry['skill_given_task'], support)
+            intent_status = 'updated'
+        except (KeyError, TypeError, ValueError) as exc:
+            posterior = prior
+            intent_status = 'retained_prior'
+            call['validation_error'] = str(exc)
+        self.intent = posterior
+        probes = [dict(r) for r in self.requests.values() if r['type'] == 'probe_intent']
+        intent_value = dict(posterior, update_status=intent_status, probe_context=probes)
+        ui = posterior['normalized_entropy']
+        self._apply('intent', intent_value, ui, provenance)
         executions = self._capability_executions()
-        successes = sum(item.get("outcome") == "success" for item in executions.values())
-        failures = sum(item.get("outcome") == "failure" for item in executions.values())
-        count = successes + failures
-        capability_events = [self.ledger.by_id()[eid] for item in executions.values()
-                             for eid in item.get("evidence_ids", [])
-                             if eid in self.ledger.by_id()]
-        if capability_events:
-            # Capability is objectively counted, so evidence volume—not an
-            # unconstrained LLM score—calibrates its uncertainty.
-            u = 1.0 / (count + 1) if count else 1.0
-            self._apply("capability", {"successes": successes, "failures": failures,
-                                       "success_rate": successes / count if count else None,
-                                       "task_execution_events": list(executions.values())},
-                        u, capability_events)
-            uncertainties["capability"] = u
-        else:
-            uncertainties["capability"] = 1.0
-
-        fulfilled = sum(c["status"] == "fulfilled" for c in commitments.values())
-        violated = sum(c["status"] == "violated" for c in commitments.values())
-        resolved = fulfilled + violated
-        u = 1.0 / (resolved + 1) if resolved else 1.0
-        reliability_events = [self.ledger.by_id()[eid] for commitment in commitments.values()
-                              for eid in commitment["evidence_ids"]
-                              if eid in self.ledger.by_id()]
-        if reliability_events:
-            self._apply("reliability", {
-                "fulfillments": fulfilled, "violations": violated,
-                "fulfillment_rate": fulfilled / resolved if resolved else None,
-                "commitment_events": list(commitments.values()),
-            }, u, reliability_events)
-        uncertainties["reliability"] = u
-
-        overall = sum(uncertainties[name] for name in SCORED) / 4
-        self._apply("uncertainty", {"per_dimension": uncertainties, "overall": overall},
-                    overall, new)
-        record = {"new_event_ids": [e.event_id for e in new], "belief_before": before,
-                  "belief_after": self.state.to_dict(), "llm_call": call,
-                  "updater_call_index": self.call_count,
-                  "preference_assessment_due": self.preference_due}
+        c = beta_stats(sum(e['outcome'] == 'success' for e in executions.values()), 0)
+        c['task_execution_events'] = list(executions.values())
+        self._apply('capability', c, c['normalized_variance'], provenance)
+        r = beta_stats(sum(e['outcome'] == 'success' for e in self.commitments.values()),
+                       sum(e['outcome'] == 'failure' for e in self.commitments.values()))
+        r['commitment_events'] = list(self.commitments.values())
+        r['communication_requests'] = list(self.requests.values())
+        self._apply('reliability', r, r['normalized_variance'], provenance)
+        uncertainties = {'intent': ui, 'capability': c['normalized_variance'],
+                         'reliability': r['normalized_variance']}
+        self._apply('uncertainty', {'per_dimension': uncertainties,
+                    'vector_order': ['intent', 'capability', 'reliability'],
+                    'vector': [uncertainties[k] for k in ('intent', 'capability', 'reliability')]},
+                    max(uncertainties.values()), provenance)
+        self.cursor = len(self.ledger.events)
+        record = {'decision_id': self.call_count, 'environment_step': information.get('step', 0),
+                  'planner_type': information.get('planner_type', 'unknown'),
+                  'interval_start_cursor': start_cursor, 'interval_end_cursor': self.cursor,
+                  'new_event_ids': [e.event_id for e in new],
+                  'legal_interval_events': [e.to_dict() for e in new],
+                  'shared_information': information, 'previous_posterior': previous,
+                  'aligned_prior': prior, 'posterior': posterior,
+                  'intent_update_status': intent_status, 'support': support,
+                  'belief_before': before, 'belief_after': self.state.to_dict(), 'llm_call': call}
         self.update_log.append(record)
         return self.state, record

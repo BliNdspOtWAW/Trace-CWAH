@@ -4,7 +4,7 @@
   "alice_model": "CWAH/models/Qwen3-8B",
   "bob_model": "CWAH/models/Qwen3-8B",
   "dataset": {"path": "CWAH/dataset-candidates/wah/test_env_set_help.pik", "episode_index": 44},
-  "bob_profile": {"id": "peer17", "text_file": "CWAH/experiment_runner/profiles/peer17.txt"},
+  "bob_profile": {"id": "peer17", "text_file": "CWAH/experiment_runner/profiles/tracev1/peer17.txt"},
   "trace_mode": "on",
   "continuous_subtasks": {
     "enabled": true, "active_count": 3, "seed": 1,

@@ -6,6 +6,7 @@ import json
 import copy
 from pathlib import Path
 from trace_tf.information import DecisionInformation
+from trace_tf.peer_observation import observe_peer, render_peer_context
 from .telemetry import measured_generate
 
 
@@ -58,15 +59,22 @@ class CommunicationModule:
     def build_decision_information(
             self, incoming_message, dialogue_history, current_skill, observation,
             agent_id=None, progress="Unknown", action_history=(), step=0,
-            source_event_ids=(), public_tasks=None, agent_control=None):
+            source_event_ids=(), public_tasks=None, agent_control=None,
+            peer_observation=None, peer_memory=None):
         observed_room, holding = observed_self_state(
             observation, agent_id if agent_id is not None else getattr(self.planner, "agent_id", None)
         )
+        if peer_observation is None:
+            observer_id = agent_id or getattr(self.planner, 'agent_id', None)
+            if observer_id is None:
+                observer_id = 1 if getattr(self.planner, 'agent_name', 'Alice') == 'Alice' else 2
+            peer_observation = observe_peer(observation, observer_id, 3 - observer_id, int(step))
         current_progress = (
             f"Current room: {observed_room}\n"
             f"Currently held objects: {holding}\n"
             f"Visible relevant objects: {visible_object_summary(observation)}\n"
             f"{progress or 'Unknown'}"
+            + render_peer_context(peer_observation, peer_memory, self.planner.oppo_name)
         )
         return DecisionInformation(
             planner_type="reactive",
@@ -82,6 +90,8 @@ class CommunicationModule:
             incoming_message=incoming_message,
             public_tasks=copy.deepcopy(public_tasks or {}),
             agent_control=copy.deepcopy(agent_control or {}),
+            peer_observation=copy.deepcopy(peer_observation or {}),
+            peer_memory=copy.deepcopy(peer_memory or {}),
         )
 
     def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,

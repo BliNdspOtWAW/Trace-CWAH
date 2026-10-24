@@ -30,6 +30,8 @@ class InterruptedTrajectoryTests(unittest.TestCase):
         state = SimpleNamespace(to_dict=lambda: {'intent': 'unknown'})
         trace = SimpleNamespace(
             ledger=SimpleNamespace(events=[]), update_log=[], state=state,
+            archive_fields=lambda: {'final_belief': state.to_dict(),
+                                   'last_decision_belief': state.to_dict()},
         )
         arena.agents = [SimpleNamespace(trace=trace)]
         with tempfile.TemporaryDirectory() as directory:

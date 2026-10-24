@@ -32,7 +32,7 @@ class EvidenceLedger:
 
     def add(self, step, kind, payload):
         if kind not in ("observation", "message", "own_action", "peer_task_progress",
-                        "peer_task_outcome", "task_completion", "own_outcome"):
+                        "peer_task_outcome", "task_completion", "own_outcome", "decision"):
             raise ValueError("unsupported TRACE evidence kind")
         event = TraceEvent("e{:05d}".format(len(self.events)), int(step), kind,
                            _json_copy(payload))
@@ -112,7 +112,7 @@ class EvidenceLedger:
             obj = nodes.get(target) if source == self.peer_id and relation.startswith("HOLDS") else nodes.get(source)
             if obj is None:
                 continue
-            if source == self.peer_id and relation.startswith("HOLDS"):
+            if source == self.peer_id and relation.startswith("HOLDS") and self.peer_id in prior_nodes:
                 task = self._task_for_object(target)
                 if task:
                     self.add(step, "peer_task_progress", {
@@ -141,11 +141,11 @@ class EvidenceLedger:
             "completed_by": completed_by,
         })
 
-    def message(self, step, sender, receiver, text, kind):
+    def message(self, step, sender, receiver, text, kind, communication=None, reply_to=None):
         if sender not in (0, 1) or receiver not in (0, 1) or kind not in ("active", "reply"):
             raise ValueError("invalid delivered message")
         return self.add(step, "message", {"sender": sender + 1, "receiver": receiver + 1,
-                                          "kind": kind, "text": text})
+                                          "kind": kind, "text": text, "communication": communication, "reply_to": reply_to})
 
     def own_action(self, step, action):
         return self.add(step, "own_action", {"action": action, "status": "selected_not_executed"})

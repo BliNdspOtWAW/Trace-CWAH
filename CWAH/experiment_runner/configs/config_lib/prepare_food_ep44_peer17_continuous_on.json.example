@@ -5,7 +5,7 @@
   },
   "bob_profile": {
     "id": "peer17",
-    "text_file": "CWAH/experiment_runner/profiles/peer17.txt"
+    "text_file": "CWAH/experiment_runner/profiles/tracev1/peer17.txt"
   },
   "trace_mode": "on",
   "continuous_subtasks": {

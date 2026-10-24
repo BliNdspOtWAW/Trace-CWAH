@@ -20,6 +20,8 @@ class DecisionInformation:
     incoming_message: str = None
     public_tasks: dict = field(default_factory=dict)
     agent_control: dict = field(default_factory=dict)
+    peer_observation: dict = field(default_factory=dict)
+    peer_memory: dict = field(default_factory=dict)
 
     def to_dict(self):
         return copy.deepcopy({
@@ -36,4 +38,6 @@ class DecisionInformation:
             "incoming_message": self.incoming_message,
             "public_tasks": self.public_tasks,
             "agent_control": self.agent_control,
+            "peer_observation": self.peer_observation,
+            "peer_memory": self.peer_memory,
         })

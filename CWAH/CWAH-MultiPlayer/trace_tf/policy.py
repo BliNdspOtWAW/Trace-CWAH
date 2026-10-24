@@ -1,87 +1,46 @@
-"""Translate evidence-backed TRACE state into planner context, not commands."""
-
+"""TRACE-v2 planner context without private peer state."""
 import json
 
-
-BELIEF_DIMENSIONS = (
-    "Belief dimensions:\n\n"
-    "- **Intent:** Bob's likely current high-level action or objective.\n"
-    "- **Capability:** Bob's observed ability to execute tasks successfully.\n"
-    "- **Preference:** Bob's inferred recurring behavioral tendencies in communication, "
-    "coordination, delegation, initiative, and responsiveness.\n"
-    "- **Reliability:** Bob's explicit task commitments and their verified fulfillment.\n"
-    "- **Uncertainty:** The uncertainty of each estimate "
-    "(0 = well supported, 1 = unknown or unsupported).\n\n"
-    "Treat uncertain estimates cautiously. Distinguish inferred intentions, "
-    "explicit commitments, and verified outcomes.\n\n"
-)
-
-
-def _recent_bob_evidence(ledger, limit):
-    return [event.to_dict() for event in ledger.events
-            if event.kind in ('peer_task_progress', 'peer_task_outcome')
-            or (event.kind == 'message' and event.payload.get('sender') == ledger.peer_id)
-            or (event.kind == 'task_completion'
-                and event.payload.get('completed_by') == 'Bob')][-limit:]
-
+COMMUNICATION_INSTRUCTIONS = '''
+TRACE-v2 communication (only this TRACE-equipped agent uses this local protocol):
+For [send_message], also output <communication_type>delegate</communication_type>
+or <communication_type>probe_intent</communication_type> with closing tags.
+delegate requests Bob undertake one COMPLETE active public subtask; select its ID
+in <subtask_id>. A request is not acceptance. probe_intent asks only Bob's current
+task/skill and creates no commitment; use null subtask_id. Consider recent probes
+and communication cost; high entropy alone does not require repeated questions.
+Keep messages within 500 characters. Neither kind cancels a running skill or
+changes already selected physical actions. Physical actions have empty messages.
+Protocol fields must be TOP-LEVEL siblings, exactly once. Never put
+communication_type, subtask_id, action, or other protocol tags inside message or
+cot. Message contains only prose addressed to Bob (ordinary object labels such
+as <apple> (375) are allowed). Misplaced/duplicate fields are rejected.
+Valid delegate example (use an actual active task ID):
+<cot>Request a division of work.</cot>
+<communication_type>delegate</communication_type>
+<message>Please complete S4 by placing the pudding on the kitchen table.</message>
+<action>[send_message]</action>
+<subtask_id>S4</subtask_id>
+For probe_intent use the same sibling layout, type probe_intent, subtask_id null,
+and a plain-language question about current task/skill.
+'''
 
 def render_policy_context(state, ledger):
-    dims = state.dimensions
-    if dims["information"].status == "unknown":
-        return "TRACE belief has no evidence yet. Do not assume anything about Bob."
-    # Information is already rendered through the planner's normal Goal/Progress/
-    # History fields. Inject only the inferred teammate belief here.
-    recent = _recent_bob_evidence(ledger, 8)
     values = {}
-    for name in ("intent", "capability", "preference", "reliability"):
-        item = dims[name]
-        values[name] = {
-            "status": item.status,
-            "value": item.value,
-            "uncertainty": item.uncertainty,
-            "evidence_ids": [e.reference for e in item.evidence[-4:]],
-        }
-    values["uncertainty"] = {
-        "status": dims["uncertainty"].status,
-        "value": dims["uncertainty"].value,
-    }
-    return (
-        "TRACE teammate belief about Bob, derived from Alice's available information:\n\n"
-        "Use this belief to inform coordination decisions when relevant. Adapt your actions, "
-        "communication, delegation, or verification strategy based on the TRACE belief "
-        "when appropriate.\n\n"
-        + BELIEF_DIMENSIONS
-        + "Recent attributable Bob evidence:\n" + json.dumps(recent, ensure_ascii=False) + "\n\n"
-        + "Teammate belief:\n" + json.dumps(values, ensure_ascii=False)
-    )
-
+    for name in ('intent', 'capability', 'reliability', 'uncertainty'):
+        item = state.dimensions[name]
+        values[name] = {'status': item.status, 'value': item.value, 'uncertainty': item.uncertainty}
+    return ('TRACE-v2 teammate belief about Bob. Intent is a joint macro-subtask/current-skill '
+            'distribution, not observed truth. Capability/reliability mean are Beta means; '
+            'normalized_variance=12*variance expresses parameter uncertainty, not failure '
+            'probability. Reliability measures whether Bob ultimately completes an accepted '
+            'task; Alice completing it counts as failure. Pending/unknown are excluded. '
+            'Preference is disabled. Uncertainty vector is [intent entropy, capability '
+            'variance, reliability variance], all in [0,1] with different meanings. '
+            'Use beliefs to choose execution, delegation or an intent probe.\n'
+            + json.dumps(values, ensure_ascii=False) + '\n' + COMMUNICATION_INSTRUCTIONS)
 
 def render_reply_context(state, ledger):
-    """Render teammate belief for message-triggered deliberation."""
-    dims = state.dimensions
-    if dims["information"].status == "unknown":
-        return "TRACE belief has no evidence yet. Do not assume anything about Bob."
-    values = {}
-    for name in ("intent", "capability", "preference", "reliability"):
-        item = dims[name]
-        values[name] = {
-            "status": item.status,
-            "value": item.value,
-            "uncertainty": item.uncertainty,
-            "evidence_ids": [e.reference for e in item.evidence[-4:]],
-        }
-    uncertainty = dims["uncertainty"]
-    values["uncertainty"] = {
-        "status": uncertainty.status,
-        "value": uncertainty.value,
-    }
-    recent = _recent_bob_evidence(ledger, 4)
-    return (
-        "TRACE teammate belief about Bob, derived from Alice's available information:\n\n"
-        "Use this belief to inform your response and coordination decisions when relevant. "
-        "Consider whether to maintain or revise your intended actions and coordination "
-        "strategy based on the TRACE belief and the newly received message.\n\n"
-        + BELIEF_DIMENSIONS
-        + "Recent attributable Bob evidence:\n" + json.dumps(recent, ensure_ascii=False) + "\n\n"
-        + "Teammate belief:\n" + json.dumps(values, ensure_ascii=False)
-    )
+    return render_policy_context(state, ledger).split(COMMUNICATION_INSTRUCTIONS)[0] + (
+        '\nRespond to this message; replies do not initiate a new local delegate/probe. '
+        'Retain current skill. Task switches guide later execution.')
