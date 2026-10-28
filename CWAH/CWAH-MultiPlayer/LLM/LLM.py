@@ -11,7 +11,8 @@ from trace_tf.information import DecisionInformation
 from trace_tf.peer_observation import render_peer_context
 from .responses_client import generate_responses
 from .active_protocol import parse_trace_active
-from .telemetry import measured_generate
+from .prompt_composer import compose_active, trace_enabled
+from .telemetry import measured_generate, record_decision
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
 df = pd.read_csv(csv_path)
@@ -112,8 +113,32 @@ class LLM:
         self.wire_api = _get_env('WIRE_API') or 'chat'
         if self.wire_api not in ('chat', 'responses'):
             raise ValueError('WIRE_API must be chat or responses')
+        thinking_setting = _get_env('CHAT_ENABLE_THINKING') or '0'
+        if thinking_setting not in ('0', '1'):
+            raise ValueError('CHAT_ENABLE_THINKING must be 0 or 1')
+        self.chat_enable_thinking = thinking_setting == '1'
+        def _module_thinking(name):
+            value = _get_env('CHAT_THINKING_' + name)
+            if value is None:
+                return self.chat_enable_thinking
+            if value not in ('0', '1'):
+                raise ValueError('CHAT_THINKING_' + name + ' must be 0 or 1')
+            return value == '1'
+        self.chat_thinking_active = _module_thinking('ACTIVE')
+        self.chat_thinking_updater = _module_thinking('UPDATER')
+        self.chat_thinking_reactive = _module_thinking('REACTIVE')
+        self.chat_reasoning_effort = _get_env('CHAT_REASONING_EFFORT') or 'low'
+        self.chat_thinking_token_budget = int(_get_env('CHAT_THINKING_TOKEN_BUDGET') or '512')
+        self.chat_updater_thinking_token_budget = int(
+            _get_env('CHAT_UPDATER_THINKING_TOKEN_BUDGET') or '256')
+        self.chat_updater_max_tokens = int(_get_env('CHAT_UPDATER_MAX_TOKENS') or '2048')
+        if (self.chat_thinking_token_budget < 1 or
+                self.chat_updater_thinking_token_budget < 1 or
+                self.chat_updater_max_tokens < 1):
+            raise ValueError('Chat thinking budgets and updater max tokens must be positive')
         self.reasoning_effort = _get_env('REASONING_EFFORT') or 'high'
         self.request_max_retries = int(_get_env('REQUEST_MAX_RETRIES') or '20')
+        self.chat_request_timeout = float(_get_env('CHAT_REQUEST_TIMEOUT') or '45')
         self.responses_output_budget = int(_get_env('RESPONSES_OUTPUT_BUDGET') or '8192')
 
         # The configured backend selects the protocol. Model names are opaque
@@ -122,6 +147,7 @@ class LLM:
         self.OPENAI_KEY = None
         self.total_cost = 0
         self.last_usage_metadata = None
+        self.last_raw_chat_outputs = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.source == 'openai':
             if self.api_key is not None:
@@ -166,10 +192,20 @@ class LLM:
                 from .local_backend import get_backend
                 backend = get_backend(lm_id, json.loads(os.getenv('CWAH_LOCAL_MODEL_OPTIONS', '{}')))
 
-            @backoff.on_exception(backoff.expo, OpenAIError)
+            @backoff.on_exception(backoff.expo, OpenAIError,
+                                  max_tries=self.request_max_retries)
             def _generate(prompt, sampling_params):
                 usage = 0
                 self.last_usage_metadata = None
+                self.last_raw_chat_outputs = None
+                self.last_api_response_status = None
+                sampling_params = (dict(sampling_params) if isinstance(sampling_params, dict)
+                                   else vars(sampling_params).copy())
+                call_type = sampling_params.pop('_trace_call_type', None)
+                thinking_enabled = {
+                    'updater': self.chat_thinking_updater,
+                    'reactive': self.chat_thinking_reactive,
+                }.get(call_type, self.chat_thinking_active)
                 if source == 'openai' and self.wire_api == 'responses':
                     generated_samples, self.last_usage_metadata = generate_responses(
                         self.api_base, self.api_key, self.lm_id, prompt, sampling_params,
@@ -184,10 +220,36 @@ class LLM:
                                 openai.api_key = self.api_key
                             if self.api_base is not None:
                                 openai.api_base = self.api_base
+                            chat_options = {}
+                            if thinking_enabled:
+                                chat_options = {
+                                    'chat_template_kwargs': {'enable_thinking': True},
+                                    'reasoning_effort': self.chat_reasoning_effort,
+                                    'thinking_token_budget': (
+                                        self.chat_updater_thinking_token_budget
+                                        if call_type == 'updater' else self.chat_thinking_token_budget),
+                                }
                             response = openai.ChatCompletion.create(
-                                model=self.lm_id, messages=prompt, **sampling_params
+                                model=self.lm_id, messages=prompt,
+                                request_timeout=self.chat_request_timeout,
+                                **sampling_params, **chat_options
                             )
-                            generated_samples = [response['choices'][i]['message']['content'] for i in range(sampling_params['n'])]
+                            self.last_api_response_status = 'ok'
+                            generated_samples = []
+                            self.last_raw_chat_outputs = [
+                                (response['choices'][i]['message']['content'] or '')
+                                for i in range(sampling_params['n'])
+                            ]
+                            for i in range(sampling_params['n']):
+                                choice = response['choices'][i]
+                                if choice.get('finish_reason') == 'length':
+                                    raise ValueError('Chat output exhausted max_tokens before a complete answer')
+                                content = self.last_raw_chat_outputs[i]
+                                if thinking_enabled:
+                                    if '</think>' not in content:
+                                        raise ValueError('Thinking output missing </think> delimiter')
+                                    content = content.rsplit('</think>', 1)[1]
+                                generated_samples.append(content.strip())
                             response_usage = response.get('usage') or {}
                             self.last_usage_metadata = {
                                 key: response_usage.get(key)
@@ -591,7 +653,7 @@ class LLM:
         progress_desc = information.current_progress
         action_history_desc = ", ".join(information.action_history) or 'None'
         dialogue_history_desc = '\n'.join(information.dialogue_history) or 'None'
-        prompt = self.prompt_template.replace('$GOAL', information.goal)
+        prompt = compose_active(self.prompt_template, belief_context).replace('$GOAL', information.goal)
         prompt = prompt.replace('$PROGRESS', progress_desc)
         prompt = prompt.replace('$STEP', str(information.step))
         prompt = prompt.replace('$ACTION_HISTORY', action_history_desc)
@@ -616,10 +678,7 @@ class LLM:
         prompt = prompt.replace('$ACTIONS_REFINE', available_plans_refine)
         if self.debug:
             print(f"prompt:\n{prompt}")
-        if 'TRACE-v2 teammate belief' in belief_context:
-            # Last output example must agree with the TRACE-only validator.
-            from trace_tf.policy import COMMUNICATION_INSTRUCTIONS
-            prompt += '\nFINAL TRACE OUTPUT CONTRACT (replaces generic message examples):\n' + COMMUNICATION_INSTRUCTIONS
+        if trace_enabled(belief_context):
             error = getattr(self, 'active_retry_error', None)
             if error:
                 prompt += '\nPrevious output was rejected: ' + error + '\nCorrect the protocol and output one complete valid choice.\n'
@@ -637,7 +696,7 @@ class LLM:
         output = outputs[0]
         import re
         trace_protocol = None
-        if 'TRACE-v2 teammate belief' in belief_context:
+        if trace_enabled(belief_context):
             trace_protocol = parse_trace_active(output, available_plans_list_refine)
             if (trace_protocol['plan'] is not None and information.public_tasks
                     and not trace_protocol.get('has_subtask_field')):
@@ -654,6 +713,7 @@ class LLM:
         self.total_cost += usage
         info["raw_output"] = output
         info["raw_outputs"] = outputs
+        info["raw_chat_output"] = ((getattr(self, 'last_raw_chat_outputs', None) or [None])[0])
         info["raw_usage"] = usage
         info["token_usage"] = self.last_usage_metadata
         info['latency_seconds'] = self.last_call_metrics['elapsed_seconds']
@@ -666,21 +726,31 @@ class LLM:
         else:
             plan,think, message = self.parse_answer(available_plans_list_refine, output)
         if plan is None:
+            if getattr(self, 'chat_thinking_active',
+                       getattr(self, 'chat_enable_thinking', False)):
+                raise ValueError('Thinking-mode Active output has no legal final action')
             info['selected_subtask_id'] = None
             info['action_parse_status'] = 'no_action'
             message = None
-        if 'TRACE-v2 teammate belief' in belief_context and plan and plan.startswith('[send_message]'):
+        if trace_enabled(belief_context) and plan and plan.startswith('[send_message]'):
             kind = trace_protocol['communication_type']
-            if kind not in ('delegate', 'probe_intent'):
-                raise ValueError('TRACE-v2 send_message requires delegate or probe_intent')
+            if kind not in ('delegate', 'probe'):
+                raise ValueError('TRACE-v2 send_message requires delegate or probe')
             selected = info['selected_subtask_id']
             if kind == 'delegate' and information.public_tasks.get(selected, {}).get('status') != 'active':
                 raise ValueError('delegate requires one active public subtask')
-            if kind == 'probe_intent' and selected is not None:
-                raise ValueError('intent probe must use null subtask_id')
+            if kind == 'probe' and selected is not None:
+                raise ValueError('probe must use null subtask_id')
+            target = trace_protocol['probe_target']
+            if kind == 'probe' and target not in ('intent', 'capability', 'reliability', 'information'):
+                raise ValueError('probe requires a valid probe_target')
+            if kind == 'delegate' and target is not None:
+                raise ValueError('delegate must omit probe_target')
             if not message or not message.strip() or len(message) > 500:
                 raise ValueError('TRACE-v2 communication needs 1..500 characters')
             info['trace_communication'] = {'type': kind, 'subtask_id': selected}
+            if kind == 'probe':
+                info['trace_communication']['probe_target'] = target
             # Construct delivery from validated prose; never reuse raw tagged text.
             plan = '[send_message] <' + message + '>'
 
@@ -706,6 +776,8 @@ class LLM:
             "agent_name": self.agent_name
         })
         info["shared_information"] = information.to_dict()
+        record_decision(self, 'active', plan is not None,
+                        None if plan is not None else 'no_legal_action')
         print("*************outputs******************")
         print(outputs)
         print("*************************************")

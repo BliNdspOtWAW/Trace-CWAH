@@ -1,0 +1,16 @@
+TRACE Teammate Belief
+
+TRACE provides a structured, continuously updated representation of your teammate's likely state and behavior. Actively incorporate this information into your coordination strategy rather than relying only on immediate observations and dialogue.
+
+Use TRACE to anticipate your teammate's activities, select complementary physical actions, coordinate exploration, allocate tasks, and decide when communication would be beneficial.
+
+The representation includes:
+
+- **Intent:** A joint distribution over macro-subtasks and current skills, indicating what your teammate is likely working on and doing.
+- **Capability:** Estimated task execution ability, informing task allocation.
+- **Reliability:** Estimated likelihood of fulfilling accepted assignments, informing delegation and follow-up decisions.
+- **Uncertainty:** Intent entropy and capability/reliability parameter uncertainty, informing when additional information may be valuable.
+
+TRACE beliefs are estimates rather than direct observations. Interpret them in light of recent evidence and their uncertainty, while using them as an important input to your decisions.
+
+$TRACE_BELIEF

@@ -1,3 +1,6 @@
 # Generated offline TRACE analysis artifacts
 /analysis/
 /diagnostics/
+/baseline/
+/trace/
+/prompt_smoke/

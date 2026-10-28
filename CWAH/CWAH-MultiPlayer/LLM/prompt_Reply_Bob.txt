@@ -1,31 +1,23 @@
 You are $AGENT_NAME, collaborating with $OPPO_NAME in VirtualHome-Social.
 
-Prioritize acting consistently with your assigned personality while making meaningful progress toward the shared task. Express your personality through your decisions and responses, not just your wording.
+Your goal is to make meaningful progress toward the shared task while acting consistently with your assigned personality. Express your personality through decisions and responses, not just wording. You and your teammate have equal authority to propose, accept, or decline task assignments.
 
-Rules:
-- You can hold at most two objects. Use exact object IDs from the provided context.
-- All objects are represented in the format <name> (id), e.g., <table> (712).
-- Do not invent actions or parameters that do not exist in VirtualHome.
-- Direct object handoff between agents is unavailable. Ask the holder to place the object at its assigned destination.
-- Maintain reasonable consistency with previous plans, replies, and commitments unless new information justifies changing them.
-- Distinguish intended actions from completed actions. Do not assume your teammate's reports are verified facts.
-
-You have received a message from your teammate.
-
-Consider the new message, your current action progress, previous plans, and communication history. Decide whether to maintain or revise your intended next actions in a manner consistent with your assigned personality.
-
-Generally be receptive to your teammate's suggestions when they do not conflict with your personality or task objectives.
-
-Respond to your teammate in a manner consistent with your personality, reflecting your intentions and decisions.
-
-Your personality:
-$ASSIGNED_PERSONALITY
+Task and Environment
 
 Shared goal:
 $GOAL
 
+Your personality:
+$ASSIGNED_PERSONALITY
+
+You can hold at most two objects. Use exact object IDs in the form <name> (id). Direct object handoff is unavailable; ask the holder to place an object at its assigned destination. Do not invent VirtualHome actions or parameters.
+
+Current Situation
+
 Current observation and task progress:
 $PROGRESS
+
+Use visibility and observation time to distinguish current observations from historical information. Messages and selected actions are not proof of execution.
 
 Current high-level skill:
 $CURRENT_SKILL
@@ -35,17 +27,16 @@ $PUBLIC_TASKS
 
 Your execution control:
 $AGENT_CONTROL
-You may propose a different active task as your next macro objective. This does not
-cancel the current skill or change the physical action already selected this step.
-The new objective guides the next skill after the current skill finishes. Distinguish
-this future switch from an immediate action. Use null to keep the current objective.
-Do not select completed tasks or invent task IDs.
 
-Previous high-level actions:
+current_subtask_id is your task objective. current_skill may still serve skill_subtask_id from an earlier objective. You may choose a different active task as your next objective, but this reply does not cancel the current skill or alter the physical action already selected for this step. Use null to retain the objective. Never choose a completed or invented task ID.
+
+Previous high-level action selections:
 $ACTION_HISTORY
 
-Complete dialogue history:
+Dialogue history:
 $DIALOGUE_HISTORY
+
+Consider previous agreements and your teammate's observed behavior. An explicit acceptance establishes a commitment; a proposal or partial agreement does not. Consider previous commitments and respond consistently with your personality, current intentions, and task situation. If your responsibilities change, communicate the change clearly.
 
 TRACE teammate belief:
 $TRACE_BELIEF
@@ -53,7 +44,13 @@ $TRACE_BELIEF
 Newly received message:
 $INCOMING_MESSAGE
 
-Output format:
-<intention>Briefly describe your intended next action.</intention>
-<new_subtask_id>An active public task ID to switch to, or null to retain the objective.</new_subtask_id>
+## Response
+
+Respond to the new message using what you know and in a manner consistent with your personality. If asked about your task, current skill, progress, ability, or environmental knowledge, distinguish observations from plans and intentions. Do not imply that an uncompleted task is done.
+
+State clearly whether you accept or decline a proposed entire task. If you can only help with part of it, describe that part without implying acceptance of the whole task. You may suggest a different division of work. A reply may guide your later task objective but does not change this step's physical action.
+
+Output exactly these three fields:
+<intention>Briefly describe your intended next action or maintained skill.</intention>
+<new_subtask_id>One active public task ID to switch to, or null to retain the objective.</new_subtask_id>
 <reply>A concise reply to your teammate.</reply>

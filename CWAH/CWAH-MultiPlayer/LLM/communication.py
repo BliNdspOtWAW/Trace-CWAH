@@ -5,9 +5,10 @@ import time
 import json
 import copy
 from pathlib import Path
+from .prompt_composer import compose_reply
 from trace_tf.information import DecisionInformation
 from trace_tf.peer_observation import observe_peer, render_peer_context
-from .telemetry import measured_generate
+from .telemetry import measured_generate, record_decision
 
 
 class ReplyFormatError(ValueError):
@@ -97,7 +98,7 @@ class CommunicationModule:
     def reply(self, incoming_message, dialogue_history, current_skill, current_room, observation,
               agent_id=None, progress="Unknown", action_history=(), belief_context="",
               decision_information=None):
-        prompt = self.prompt_template
+        prompt = compose_reply(self.prompt_template, belief_context)
         information = decision_information or self.build_decision_information(
             incoming_message, dialogue_history, current_skill, observation,
             agent_id=agent_id, progress=progress, action_history=action_history,
@@ -122,10 +123,16 @@ class CommunicationModule:
         sampling = self.planner.sampling_params
         params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
         params["n" if self.planner.chat else "num_return_sequences"] = 1
+        thinking_enabled = getattr(self.planner, 'chat_thinking_reactive',
+                                   getattr(self.planner, 'chat_enable_thinking', False))
         if self.planner.chat:
-            params["max_tokens"] = min(params.get("max_tokens", 256), 256)
+            params["max_tokens"] = (max(params.get("max_tokens", 2048), 2048)
+                                    if thinking_enabled
+                                    else min(params.get("max_tokens", 256), 256))
         else:
             params["max_new_tokens"] = min(params.get("max_new_tokens", 256), 256)
+        if self.planner.chat:
+            params['_trace_call_type'] = 'reactive'
         started = time.monotonic()
         outputs, legacy_cost = measured_generate(
             self.planner, request, params, 'reactive', information,
@@ -149,6 +156,7 @@ class CommunicationModule:
             "model": self.planner.lm_id,
             "prompt": prompt,
             "raw_output": raw,
+            "raw_chat_output": (getattr(self.planner, 'last_raw_chat_outputs', None) or [None])[0],
             "intention": intention,
             "reply": reply,
             "new_subtask_id": None if task_id in (None, '', 'null', 'None') else task_id,
@@ -163,5 +171,7 @@ class CommunicationModule:
         if not intention or not reply or (information.public_tasks and (task_match is None or not task_id)):
             call['parse_status'] = 'error'
             call['parse_error'] = 'missing_or_empty_required_reactive_fields'
+            record_decision(self.planner, 'reactive', False, call['parse_error'])
             raise ReplyFormatError(call)
+        record_decision(self.planner, 'reactive', True)
         return reply, call

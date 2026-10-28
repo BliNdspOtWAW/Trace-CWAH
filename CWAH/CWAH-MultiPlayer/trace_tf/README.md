@@ -10,7 +10,8 @@ the v0 single intent/LLM uncertainty/commitment scheme.
   normalizes the joint distribution and computes normalized entropy.
 - Capability and Reliability use Beta(1+successes,1+failures). Uncertainty is
   `12*posterior_variance`, in [0,1]. Preference is disabled.
-- Only TRACE-equipped Alice has typed delegate/probe_intent output. Bob and
+- Only TRACE-equipped Alice has typed delegate/probe output. A probe also
+  records its primary target dimension locally. Bob and
   TRACE-off behavior remain on the existing natural-language contract.
 - Accepted task delegations succeed on Bob's public completion and fail on
   Alice's completion; unresolved/unknown outcomes are excluded. No deadlines.

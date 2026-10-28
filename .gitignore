@@ -18,6 +18,8 @@ env/
 !**/.env.template
 !CWAH/experiment_runner/.env.jd.example
 !CWAH/experiment_runner/.env.ds.example
+!CWAH/experiment_runner/.env.self.example
+!CWAH/experiment_runner/.env.qwen.example
 **/env.local.sh
 *.pem
 *.key

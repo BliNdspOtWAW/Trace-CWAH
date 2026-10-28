@@ -109,6 +109,14 @@ class PeerCommunicationTests(unittest.TestCase):
         self.assertIn("[goexplore] <kitchen> (11)", call["prompt"])
         self.assertIn("Bob likely intends to search the kitchen.", call["prompt"])
         self.assertEqual(planner.generator.call_args.args[1]["max_tokens"], 256)
+        planner.chat_enable_thinking = True
+        CommunicationModule(planner).reply(
+            "message 4", history, "[gocheck] <cabinet> (2)", "kitchen",
+            {"nodes": [{"class_name": "apple", "id": 12, "category": "Objects"}]},
+            progress="One object remains", action_history=["[goexplore] <kitchen> (11)"],
+            belief_context="Bob likely intends to search the kitchen.",
+        )
+        self.assertEqual(planner.generator.call_args.args[1]["max_tokens"], 2048)
 
     def test_reply_uses_fresh_own_holding_not_peer_or_stale_room(self):
         planner = SimpleNamespace(
@@ -160,7 +168,7 @@ class PeerCommunicationTests(unittest.TestCase):
         bob = LLM("debug", "test", "unused", True, False, args, 2)
         self.assertIn("equal authority", alice.prompt_template)
         self.assertIn("equal authority", bob.prompt_template)
-        self.assertIn("reasonable consistency", alice.prompt_template)
+        self.assertIn("Maintain consistency with accepted commitments", alice.prompt_template)
         self.assertNotIn("$AGENT_NAME", alice.prompt_template)
         self.assertNotIn("$AGENT_NAME", bob.prompt_template)
         self.assertTrue(alice.prompt_template_path.endswith('prompt_Alice.txt'))

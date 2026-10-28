@@ -2,6 +2,7 @@
 import copy
 import json
 import math
+import os
 import unittest
 import tempfile
 import pickle
@@ -28,6 +29,24 @@ def message(sender, text, kind='active', step=0, **extra):
     return dict(step=step, sender=sender, receiver=1-sender, text=text, kind=kind, **extra)
 
 class TraceUpdaterTests(unittest.TestCase):
+    def test_thinking_updater_uses_separate_budget_and_output_limit(self):
+        updater, planner = self.make()
+        planner.chat_enable_thinking = True
+        planner.chat_updater_max_tokens = 2048
+        updater.update(info())
+        params = planner.generator.call_args.args[1]
+        self.assertEqual(params['max_tokens'], 2048)
+        self.assertEqual(params['_trace_call_type'], 'updater')
+
+    def test_updater_identifies_its_call_when_only_active_uses_thinking(self):
+        updater, planner = self.make()
+        planner.chat_thinking_updater = False
+        planner.chat_thinking_active = True
+        updater.update(info())
+        params = planner.generator.call_args.args[1]
+        self.assertEqual(params['max_tokens'], 1536)
+        self.assertEqual(params['_trace_call_type'], 'updater')
+
     def make(self):
         planner = SimpleNamespace(sampling_params={'n': 1, 'max_tokens': 1024}, chat=True,
             lm_id='test', last_usage_metadata={}, generator=Mock())
@@ -43,8 +62,11 @@ class TraceUpdaterTests(unittest.TestCase):
             'task_probs': dist['task_probs'], 'skill_given_task': dist['skill_given_task']},
             'delegation_responses': list(responses)})], 0)
 
-    def delegate(self, updater, kind='delegate'):
-        updater.stage_communication({'type': kind, 'subtask_id': 'S1' if kind == 'delegate' else None})
+    def delegate(self, updater, kind='delegate', probe_target='intent'):
+        metadata = {'type': kind, 'subtask_id': 'S1' if kind == 'delegate' else None}
+        if kind == 'probe':
+            metadata['probe_target'] = probe_target
+        updater.stage_communication(metadata)
         request = updater.receive_message(message(0, 'Please complete S1' if kind == 'delegate' else 'What task?'))
         reply = updater.receive_message(message(1, 'I accept S1', 'reply', parent_sender=0))
         return {'request_event_id': request.event_id, 'reply_event_id': reply.event_id, 'response': 'accepted'}
@@ -97,7 +119,11 @@ class TraceUpdaterTests(unittest.TestCase):
         self.assertEqual(state.dimensions['preference'].status, 'unknown')
         self.assertEqual(state.dimensions['uncertainty'].value['vector_order'], ['intent', 'capability', 'reliability'])
         self.assertNotIn('overall', state.dimensions['uncertainty'].value)
-        self.assertIn('probe_intent', render_policy_context(state, u.ledger))
+        self.assertNotIn('<communication_type>', render_policy_context(state, u.ledger))
+        self.assertEqual(set(json.loads(render_policy_context(state, u.ledger))),
+                         {'intent', 'capability', 'reliability', 'uncertainty'})
+        from LLM.prompt_composer import compose_active
+        self.assertIn('probe', compose_active('$OUTPUT_CONTRACT', render_policy_context(state, u.ledger)))
         self.assertNotIn('<communication_type>', render_reply_context(state, u.ledger))
 
     def test_invalid_llm_output_retains_aligned_prior(self):
@@ -110,6 +136,40 @@ class TraceUpdaterTests(unittest.TestCase):
         self.assertEqual(record['intent_update_status'], 'retained_prior')
         self.assertEqual(u.intent['joint'], old['joint'])
         self.assertEqual(record['llm_call']['raw_output'], 'not json')
+        self.assertIn('validation_error', record['llm_call'])
+
+    def test_truncated_updater_retains_prior_and_records_reason(self):
+        u, p = self.make()
+        u.update(info())
+        old = copy.deepcopy(u.intent)
+        p.generator.side_effect = ValueError('Chat output exhausted max_tokens')
+        _, record = u.update(info(1))
+        self.assertEqual(record['intent_update_status'], 'retained_prior')
+        self.assertEqual(u.intent['joint'], old['joint'])
+        self.assertIn('exhausted max_tokens', record['llm_call']['error'])
+
+    def test_invalid_probability_is_recorded_as_failed_decision(self):
+        u, p = self.make()
+        u.update(info())
+        old = copy.deepcopy(u.intent)
+        support = candidates({'S1': TASK})
+        dist = uniform(support)
+        dist['task_probs']['S1'] = -1
+        p.generator.return_value = ([json.dumps({'intent': {
+            'task_probs': dist['task_probs'],
+            'skill_given_task': dist['skill_given_task']},
+            'delegation_responses': []})], 0)
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {
+                'CWAH_METRICS_PATH': str(Path(temporary) / 'calls.jsonl')}):
+            _, record = u.update(info(1))
+            rows = [json.loads(line) for line in (Path(temporary) / 'calls.jsonl').read_text().splitlines()]
+        self.assertEqual(record['intent_update_status'], 'retained_prior')
+        self.assertEqual(u.intent['joint'], old['joint'])
+        self.assertTrue(record['llm_call']['validation_error'])
+        self.assertEqual(rows[-2]['api_status'], 'ok')
+        self.assertEqual(rows[-1]['event'], 'decision_end')
+        self.assertEqual(rows[-1]['status'], 'error')
+        self.assertTrue(rows[-1]['reason'])
 
     def test_task_retirement_and_new_task_have_valid_mass(self):
         old = uniform(candidates({'S1': TASK}))
@@ -139,11 +199,16 @@ class TraceUpdaterTests(unittest.TestCase):
 
     def test_probe_unsolicited_claim_and_unlinked_reply_do_not_create_commitments(self):
         u, p = self.make()
-        proposal = self.delegate(u, 'probe_intent')
+        proposal = self.delegate(u, 'probe', 'information')
         self.answer(u, p, [proposal])
         state, _ = u.update(info())
         self.assertEqual(u.commitments, {})
         self.assertEqual(len(state.dimensions['intent'].value['probe_context']), 1)
+        self.assertEqual(state.dimensions['intent'].value['probe_context'][0]['type'], 'probe')
+        self.assertEqual(state.dimensions['intent'].value['probe_context'][0]['probe_target'], 'information')
+        self.assertEqual(state.dimensions['reliability'].value['communication_requests'][0]['probe_target'], 'information')
+        self.assertEqual(state.dimensions['capability'].value['mean'], 0.5)
+        self.assertEqual(state.dimensions['reliability'].value['mean'], 0.5)
         u.receive_message(message(1, 'I will complete S1'))
         u.update(info(1))
         self.assertEqual(u.commitments, {})
@@ -153,6 +218,14 @@ class TraceUpdaterTests(unittest.TestCase):
         self.answer(u2, p2, [proposal])
         u2.update(info())
         self.assertEqual(u2.commitments, {})
+
+    def test_probe_target_must_be_valid_before_staging(self):
+        u, _ = self.make()
+        for target in (None, 'other'):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                u.stage_communication({'type': 'probe', 'subtask_id': None,
+                                       'probe_target': target})
+        self.assertIsNone(u.pending_outgoing)
 
     def test_reject_and_unclear_do_not_count_as_failures(self):
         for response in ('rejected', 'unclear'):

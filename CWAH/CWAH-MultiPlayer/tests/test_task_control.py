@@ -116,6 +116,47 @@ class TaskControlTests(unittest.TestCase):
         a.accept_active_choice('S4', '[gograb] <pudding> (370)')
         self.assertEqual(a.control_context()['skill_subtask_id'], 'S4')
 
+    def test_bob_reply_switches_macro_without_changing_running_s2_put(self):
+        bob = agent()
+        bob.agent_id = 2
+        bob.set_public_tasks({
+            'S2': dict(tasks()['S3'], subtask_id='S2'),
+            'S4': tasks()['S4'],
+        })
+        running = '[goput] <apple> (375) <kitchentable> (72)'
+        bob.accept_active_choice('S2', running)
+        bob.steps = 1
+        bob.current_room = {'class_name': 'kitchen'}
+        bob.last_action = '[putback] <apple> (375) <kitchentable> (72)'
+        bob.action_history, bob.dialogue_history = [], []
+        bob._observe_peer = Mock()
+        bob._peer_context = Mock(return_value={})
+        bob.LLM = SimpleNamespace(
+            agent_name='Bob', oppo_name='Alice', personality='helpful',
+            goal_desc='place apple and pudding', lm_id='test', chat=True,
+            sampling_params={'max_tokens': 256, 'n': 1},
+            last_usage_metadata=None, generator=Mock(return_value=([
+                '<intention>Finish S2, then work on S4.</intention>'
+                '<new_subtask_id>S4</new_subtask_id>'
+                '<reply>I accept S4 after finishing my current placement.</reply>'
+            ], 0)),
+        )
+        bob.communication_module = CommunicationModule(bob.LLM)
+
+        reply, call = bob.reply_to_message(
+            'Please complete S4.', {'nodes': [], 'edges': []})
+        self.assertIn('accept S4', reply)
+        self.assertTrue(call['macro_changed'])
+        self.assertEqual(bob.control_context(), {
+            'current_subtask_id': 'S4', 'current_skill': running,
+            'skill_subtask_id': 'S2'})
+        self.assertEqual(bob.last_action,
+                         '[putback] <apple> (375) <kitchentable> (72)')
+        bob.plan = None  # The S2 skill finishes before another Active decision.
+        self.assertEqual(bob.control_context(), {
+            'current_subtask_id': 'S4', 'current_skill': None,
+            'skill_subtask_id': None})
+
     def test_invalid_or_completed_target_changes_nothing(self):
         a = agent()
         a.accept_active_choice('S3', '[gograb] <apple> (375)')

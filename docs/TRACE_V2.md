@@ -64,16 +64,24 @@ this vector uses its maximum only as a conservative serialization envelope.
 ## Communication
 
 Only TRACE-on Alice's Active output additionally requires
-`<communication_type>delegate|probe_intent</communication_type>` when choosing
-send_message. delegate binds an active subtask_id; probe_intent requires null.
+`<communication_type>delegate|probe</communication_type>` when choosing
+send_message. delegate binds an active subtask_id; probe requires null and a
+top-level `<probe_target>` of `intent`, `capability`, `reliability`, or
+`information`. Delegation and physical actions omit `probe_target`.
 Missing/invalid metadata enters the existing bounded Active retry path. Delivery
 keeps the ordinary natural-language payload, capped at 500 characters.
 
 Local request metadata is attached to Alice's delivered ledger event. Bob's
 ordinary immediate reply is linked locally; Bob needs no new output fields.
 delegate creates a reliability record only after explicit acceptance is parsed.
-probe_intent asks about intent only, records request/reply references under Intent,
-and never creates commitments. Replies remain unverified claims. Reactive replies
+probe asks for decision-relevant information about intent, capability, progress,
+or environment knowledge. Its chosen target is saved with the local request
+metadata, request/reply event IDs, step, and message text; the target field is
+not delivered to Bob. Requests also appear under Intent as probe provenance,
+regardless of target category. A target label describes Alice's question, not a
+verified observation or an automatic update to that dimension. Probes never
+create commitments. Replies remain unverified claims and
+do not directly update Capability or Reliability Beta counts. Reactive replies
 cannot initiate a second typed active request. No communication cancels a running
 skill or modifies the step's frozen physical action. Bob's existing Reactive may
 still change its future macro target after either message type.

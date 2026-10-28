@@ -24,15 +24,17 @@ From the repository root, with the CWAH environment activated:
 python CWAH/experiment_runner/download_qwen3.py --destination <MODEL_DIRECTORY>
 ```
 
-Templates are under `CWAH/experiment_runner/configs/qwen3/`. Configure model paths
-in private local JSON files. Configuration `--check` does not load weights.
+The old Qwen3-8B experiment templates have been removed. If using the local
+Hugging Face backend, configure model paths in private JSON files.
+Configuration `--check` does not load weights.
 Coordinate an explicit GPU before loading; device availability and memory must
 be checked for each run. Parallel configurations do not automatically share one
 GPU-resident model.
 
-Qwen-specific Reactive prompts reinforce closed output tags. They improve
-formatting but do not guarantee correct coordination or eliminate repetitive
-communication. Task control protocol and verification details are documented in
+Local Qwen now uses the same role-specific Reactive prompts as API models.
+Tagged output remains required by the Reply parser; model-specific formatting
+and coordination quality must be checked in a real run. Task control protocol
+and verification details are documented in
 `CWAH_TASK_CONTROL.md` and the commit records.
 
 The inherited budget-as-success issue remains: use Continuous completed-subtask

@@ -14,6 +14,11 @@ RULES = '''You are performing OFFLINE retrospective inference about Bob.
 The hidden state is (subtask, skill) at the START decision, never the end decision.
 Bob may switch task or skill DURING the interval. Evaluate the complete subsequent
 evidence allowing these switches; do not assume the start Intent persists throughout.
+History contains actual START online fact sections, not an expanded raw ledger.
+new_evidence is the exact next online formatted event list; new_information
+contains factual fields changed by the next input boundary, before its inference.
+Neither contains the next posterior. Start evidence is already reflected in the
+supplied prior for branch B; do not count it again as newly arrived evidence.
 Use only the supplied Alice-legal history and ordered new evidence. Do not invent
 hidden actions. Observation appearance/disappearance is visibility, not proof of
 grab/place/movement. Messages are claims, not verified execution. Alice's selected

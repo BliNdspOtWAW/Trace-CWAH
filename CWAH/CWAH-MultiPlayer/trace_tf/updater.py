@@ -7,9 +7,9 @@ from .model import BeliefState, Evidence, EvidenceSource
 from .schema import V2_SCHEMA
 from .peer_observation import observe_peer
 from .probability import candidates, distribution, align_prior, beta_stats
-from LLM.telemetry import measured_generate
+from LLM.telemetry import measured_generate, record_decision
 
-PROMPT = Path(__file__).with_name('prompt_Updater.txt').read_text(encoding='utf-8')
+PROMPT = (Path(__file__).resolve().parent.parent / 'LLM' / 'prompts' / 'trace' / 'updater.txt').read_text(encoding='utf-8')
 
 
 class HybridUpdater:
@@ -110,6 +110,11 @@ class HybridUpdater:
         return executions
 
     def stage_communication(self, metadata):
+        if metadata.get('type') == 'probe' and metadata.get('probe_target') not in (
+                'intent', 'capability', 'reliability', 'information'):
+            raise ValueError('probe requires a valid probe_target')
+        if metadata.get('type') == 'delegate' and metadata.get('probe_target') is not None:
+            raise ValueError('delegate must omit probe_target')
         self.pending_outgoing = dict(metadata)
 
     def receive_message(self, event):
@@ -241,7 +246,14 @@ class HybridUpdater:
         params = dict(sampling) if isinstance(sampling, dict) else vars(sampling).copy()
         params['n' if self.planner.chat else 'num_return_sequences'] = 1
         params['temperature'] = 0
-        params['max_tokens' if self.planner.chat else 'max_new_tokens'] = max(1536, 100 * len(support))
+        thinking_enabled = getattr(self.planner, 'chat_thinking_updater',
+                                   getattr(self.planner, 'chat_enable_thinking', False))
+        updater_max_tokens = (getattr(self.planner, 'chat_updater_max_tokens', 2048)
+                              if thinking_enabled else 1536)
+        params['max_tokens' if self.planner.chat else 'max_new_tokens'] = max(
+            updater_max_tokens, 100 * len(support))
+        if self.planner.chat:
+            params['_trace_call_type'] = 'updater'
         request = [{'role': 'user', 'content': prompt}] if self.planner.chat else prompt
         outputs, cost = measured_generate(self.planner, request, params, 'updater', information,
             sections={'information': values['$INFORMATION'], 'prior_belief': prior,
@@ -249,6 +261,7 @@ class HybridUpdater:
             counts={'new_events': len(new), 'decision_id': self.call_count})
         raw = outputs[0] if outputs else ''
         call = {'model': self.planner.lm_id, 'prompt': prompt, 'raw_output': raw,
+                'raw_chat_output': (getattr(self.planner, 'last_raw_chat_outputs', None) or [None])[0],
                 'usage': self.planner.last_usage_metadata, 'legacy_cost_estimate': cost}
         try:
             cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip())
@@ -285,6 +298,7 @@ class HybridUpdater:
         self._apply('information', information, 0.0, provenance)
         call = None
         inference = {}
+        previous_call_id = (getattr(self.planner, 'last_call_metrics', None) or {}).get('call_id')
         try:
             inference, call = self._infer(information, prior, support, new)
         except Exception as exc:
@@ -299,8 +313,12 @@ class HybridUpdater:
             posterior = prior
             intent_status = 'retained_prior'
             call['validation_error'] = str(exc)
+        current_call_id = (getattr(self.planner, 'last_call_metrics', None) or {}).get('call_id')
+        if current_call_id and current_call_id != previous_call_id:
+            record_decision(self.planner, 'updater', intent_status == 'updated',
+                            (call or {}).get('error') or (call or {}).get('validation_error'))
         self.intent = posterior
-        probes = [dict(r) for r in self.requests.values() if r['type'] == 'probe_intent']
+        probes = [dict(r) for r in self.requests.values() if r['type'] == 'probe']
         intent_value = dict(posterior, update_status=intent_status, probe_context=probes)
         ui = posterior['normalized_entropy']
         self._apply('intent', intent_value, ui, provenance)

@@ -24,6 +24,11 @@ The macro target has switched to S4, but the current skill still serves S3.
 Reactive never cancels that skill or changes this step's already selected
 physical action. Skill completion/invalidation clears only the skill and its
 origin; an active macro target survives for the next planning call.
+While the S3 skill is still running, the control snapshot can show S4/S3 but
+the agent normally continues that skill without another Active Planner call.
+When the skill ends, `skill_subtask_id` becomes null; the next Active Planner
+receives S4 as `current_subtask_id` with no running skill. The same transition
+applies to Bob, including a running S2 `goput` followed by an accepted S4 request.
 
 Active emits a closed `<subtask_id>` field along with the original cot/message/
 action fields. The runtime validates that the ID is active and that grab/put
@@ -35,8 +40,8 @@ field are rejected during runner preflight instead of failing after model calls.
 
 Reactive emits `<intention>`, `<new_subtask_id>` and `<reply>`. Null means retain
 the macro target; an active ID proposes a subsequent target. Invalid IDs are
-logged and the reply is not delivered as an accepted agreement. Qwen-specific
-formatting instructions now require all three closing tags.
+logged and the reply is not delivered as an accepted agreement. All backends
+use the role-specific Reply prompts with the same three tagged fields.
 
 One environment step is ordered as:
 

@@ -59,15 +59,26 @@ remain separate, including empty-evidence intervals. Environment step is only
 display metadata. Cursors, IDs, prior mass and full support are validated strictly.
 Unpaired terminal evidence is counted in the manifest and excluded from metrics.
 
-History is the complete starting legal ledger plus whitelisted start information.
-No automatic history truncation or independent summarization is performed. This
-can exceed a model context window on long runs; such calls fail explicitly.
-Every logged partial observation frame is retained (geometry/state metadata is
-projected deterministically), not just endpoints. Historical/current visibility
-and message claims remain distinct. No global graphs, Bob private actions,
-profiles, raw online model prompts, or numerical belief snapshots enter common
-inputs. Derived outcomes and observations are not independent confirmations.
-Alice controls/actions are conditioning information, not automatic execution proof.
+History is reconstructed from actual saved online updater Prompt sections:
+whitelisted factual Information, that decision's formatted events, and factual
+request/reply text. Prior, numeric belief fields, request classifications and
+online inference instructions are excluded. Saved Information, support and
+aligned prior are checked against the corresponding decision snapshots. Missing
+or unsupported saved prompts fail explicitly rather than using full raw history.
+
+New evidence uses the next saved online formatted event list verbatim. Its IDs,
+order, steps and non-observation payloads are checked against the raw ledger and
+legal_interval_events. Observations use exactly the online peer visibility/state
+representation, not raw scene graphs. Changed next-boundary factual Information
+fields (including newly generated public tasks) are also supplied, never next
+beliefs or LLM outputs. A and B share identical common input.
+
+Raw events are referenced by source SHA256, event IDs and cursor ranges for
+audit, not expanded into prompts. Each interval also records online prompt and
+formatted-event hashes plus common input character count. No LLM summarization,
+extra all-history replay or additional online recording is needed. Protocol
+v3-online-facts requires preparing a new analysis batch; old large-input batches
+remain separate and cannot be resumed under the new protocol.
 
 The analysis trusts the provenance of TRACE's legal ledger; it cannot repair
 incorrect event attribution in a source trajectory. Load pickle only from trusted

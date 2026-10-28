@@ -7,13 +7,35 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from LLM.telemetry import measured_generate
+from LLM.telemetry import measured_generate, record_decision
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'experiment_runner'))
 from metric_reports import export_metrics
 
 
 class TelemetryTests(unittest.TestCase):
+    def test_api_success_and_decision_failure_are_separate(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {
+                'CWAH_METRICS_PATH': str(Path(temporary) / 'calls.jsonl')}):
+            planner = self.planner()
+            def truncated(_request, _params):
+                planner.last_api_response_status = 'ok'
+                raise ValueError('finish_reason=length')
+            planner.generator = Mock(side_effect=truncated)
+            with self.assertRaises(ValueError):
+                measured_generate(planner, [{'role': 'user', 'content': 'prompt'}],
+                                  {'max_tokens': 2048, 'n': 1}, 'active')
+            record_decision(planner, 'active', False, 'finish_reason=length')
+            rows = [json.loads(line) for line in (Path(temporary) / 'calls.jsonl').read_text().splitlines()]
+            self.assertEqual([row['event'] for row in rows],
+                             ['call_start', 'call_end', 'decision_end'])
+            self.assertEqual(rows[1]['api_status'], 'ok')
+            self.assertEqual(rows[1]['status'], 'error')
+            summary = export_metrics(temporary)['overall']
+            self.assertEqual(summary['api_success_calls'], 1)
+            self.assertEqual(summary['valid_decision_calls'], 0)
+            self.assertEqual(summary['invalid_decision_calls'], 1)
+
     def planner(self):
         return SimpleNamespace(
             agent_name='Alice', agent_id=1, lm_id='test-model', source='openai',

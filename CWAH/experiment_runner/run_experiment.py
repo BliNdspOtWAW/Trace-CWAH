@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import pickle
@@ -37,15 +38,8 @@ def _path(value):
 
 
 def _reply_prompt_path(backend, model, role):
-    """Specialize formatting only for locally configured Qwen model families."""
-    qwen = False
-    if backend == 'huggingface':
-        model_config = _path(model) / 'config.json'
-        if model_config.is_file():
-            kind = json.loads(model_config.read_text(encoding='utf-8')).get('model_type', '')
-            qwen = isinstance(kind, str) and kind.startswith('qwen')
-    variant = 'Qwen_' if qwen else ''
-    path = GAME_ROOT / 'LLM' / f'prompt_Reply_{variant}{role.title()}.txt'
+    """Use the same role-specific Reactive prompt for every model backend."""
+    path = GAME_ROOT / 'LLM' / f'prompt_Reply_{role.title()}.txt'
     if not path.is_file():
         raise ValueError(f'Missing reply prompt: {path}')
     return path
@@ -205,11 +199,18 @@ def validate(config):
         prompt_path = _path(raw) if raw else GAME_ROOT / "LLM" / f"prompt_{role.title()}.txt"
         if not prompt_path.is_file() or not prompt_path.read_text(encoding="utf-8").strip():
             raise ValueError(f"{role} prompt missing or empty: {prompt_path}")
+        spec = importlib.util.spec_from_file_location('cwah_prompt_composer', GAME_ROOT / 'LLM' / 'prompt_composer.py')
+        composer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(composer)
+        effective_prompt = composer.compose_active(
+            prompt_path.read_text(encoding='utf-8'),
+            'TRACE-v2 teammate belief' if mode == 'on' and role == 'alice' else '')
         required = ('$PUBLIC_TASKS', '$AGENT_CONTROL', '<subtask_id>')
-        if not all(value in prompt_path.read_text(encoding='utf-8') for value in required):
+        if not all(value in effective_prompt for value in required):
             raise ValueError(f'{role} prompt does not support task-control protocol v2: {prompt_path}')
         prompt_files[role] = prompt_path
-    if mode == "on" and "$TRACE_BELIEF" not in prompt_files["alice"].read_text(encoding="utf-8"):
+    if mode == "on" and "$TRACE_BELIEF" not in composer.compose_active(
+            prompt_files["alice"].read_text(encoding="utf-8"), "TRACE-v2 teammate belief"):
         raise ValueError("TRACE-on Alice prompt must contain $TRACE_BELIEF")
     for role in ('alice', 'bob'):
         reply_path = _reply_prompt_path(backend, config[role + '_model'], role)
@@ -474,6 +475,31 @@ def _run_validated(config, selected, episode, index, port):
             if child_env.get(prefix + '_WIRE_API', 'chat') == 'responses' else None
             for role, prefix in [('alice', 'CWAH_AGENT'), ('bob', 'CWAH_HUMAN')]
         },
+        "chat_thinking": {
+            role: ({
+                "enabled": child_env.get(prefix + '_CHAT_ENABLE_THINKING', '0') == '1',
+                "active_enabled": child_env.get(
+                    prefix + '_CHAT_THINKING_ACTIVE',
+                    child_env.get(prefix + '_CHAT_ENABLE_THINKING', '0')) == '1',
+                "updater_enabled": child_env.get(
+                    prefix + '_CHAT_THINKING_UPDATER',
+                    child_env.get(prefix + '_CHAT_ENABLE_THINKING', '0')) == '1',
+                "reactive_enabled": child_env.get(
+                    prefix + '_CHAT_THINKING_REACTIVE',
+                    child_env.get(prefix + '_CHAT_ENABLE_THINKING', '0')) == '1',
+                "reasoning_effort": child_env.get(prefix + '_CHAT_REASONING_EFFORT', 'low'),
+                "planner_budget": child_env.get(prefix + '_CHAT_THINKING_TOKEN_BUDGET', '512'),
+                "updater_budget": child_env.get(prefix + '_CHAT_UPDATER_THINKING_TOKEN_BUDGET', '256'),
+                "updater_max_tokens": child_env.get(prefix + '_CHAT_UPDATER_MAX_TOKENS', '2048'),
+                "reply_max_tokens": 2048 if child_env.get(
+                    prefix + '_CHAT_THINKING_REACTIVE',
+                    child_env.get(prefix + '_CHAT_ENABLE_THINKING', '0')) == '1' else 256,
+                "request_timeout": child_env.get(prefix + '_CHAT_REQUEST_TIMEOUT', '45'),
+                "request_max_retries": child_env.get(prefix + '_REQUEST_MAX_RETRIES', '20'),
+            } if selected['backend'] == 'openai' and
+                child_env.get(prefix + '_WIRE_API', 'chat') == 'chat' else None)
+            for role, prefix in [('alice', 'CWAH_AGENT'), ('bob', 'CWAH_HUMAN')]
+        },
         "continuous_subtasks": selected["continuous_subtasks"],
         "experiment_label": selected["experiment_label"],
         "planner_prompt_files": {role: str(path) for role, path in selected["prompt_files"].items()},
@@ -501,8 +527,11 @@ def _run_validated(config, selected, episode, index, port):
                 "bob": selected['prompt_files']['bob'],
                 "reply_alice": reply_files['alice'],
                 "reply_bob": reply_files['bob'],
-                "updater": GAME_ROOT / "trace_tf" / "prompt_Updater.txt",
+                "updater": GAME_ROOT / "LLM" / "prompts" / "trace" / "updater.txt",
                 "trace_policy": GAME_ROOT / "trace_tf" / "policy.py",
+                "prompt_composer": GAME_ROOT / "LLM" / "prompt_composer.py",
+                **{str(path.relative_to(GAME_ROOT)): path for path in
+                   sorted((GAME_ROOT / "LLM" / "prompts").rglob("*.txt"))},
             }.items()
         },
         "observation_type": "partial", "communication": True,

@@ -72,7 +72,7 @@ class ExperimentRunnerTests(unittest.TestCase):
 
     def test_role_specific_original_human_prompt(self):
         peer = run_experiment.GAME_ROOT / "LLM" / "prompt_Peer.txt"
-        human = run_experiment.GAME_ROOT / "LLM" / "prompt_Human.txt"
+        human = run_experiment.GAME_ROOT / "LLM" / "archived_prompts" / "prompt_Human.txt"
         args = SimpleNamespace(debug=False, act=False, big_5=None, api_base=None, api_key=None,
                                alice_prompt_file=str(peer), bob_prompt_file=str(human))
         alice = LLM("debug", "test", "unused", True, False, args, 1)

@@ -1,0 +1,72 @@
+Update Alice's TRACE belief about Bob before each Active or Reactive decision.
+
+Infer Bob's current state using only the supplied information. Bob's private plans, actions, and personality are unavailable.
+
+## Intent Inference
+
+Intent is the joint distribution of Bob's CURRENT macro-subtask and executing HIGH-LEVEL skill, not his next primitive action or future plan.
+
+A macro-subtask change does not necessarily change an ongoing skill. Predict the current macro-subtask and the skill conditioned on it.
+
+Use the aligned prior as a starting estimate and update it with new observations, dialogue, and task events. Consider evidence timing, consistency, and relevance. New evidence may support or overturn the prior; insufficient evidence should preserve uncertainty. Elapsed time alone does not justify greater certainty.
+
+Messages and probe replies are claims, not verified execution. Distinguish Bob's current activities from future plans.
+
+A probe request may carry a `probe_target` label (intent, capability, reliability, or information). This records what Alice asked about; it is not evidence that the target belief changed. Use the reply for Intent inference only where its content is relevant.
+
+Capability and Reliability counts are updated separately from public outcomes and accepted-task settlement, never from a self-report alone.
+
+## Probability Output
+
+Return nonnegative weights reflecting the relative plausibility of EVERY task and its exact skill keys in the support.
+
+Every task distribution and conditional skill row must have positive total weight. Individual weights may be zero. The runtime normalizes them to form P(task, skill) = P(task) × P(skill | task).
+
+`none` means no task-specific objective; `idle` means no executing skill.
+
+Do not output explanations, preference, capability/reliability estimates, or uncertainty scores. The runtime handles those separately.
+
+## Delegation Classification
+
+For each unclassified delegation request with a linked Bob reply, classify it as `accepted`, `rejected`, or `unclear`.
+
+Acceptance requires explicit agreement to complete the ENTIRE assigned task. Partial assistance does not count as acceptance. Use the exact request/reply event IDs.
+
+Do not classify probes as delegations or completion reports as acceptance.
+
+## Observation Boundaries
+
+`Information.peer_observation` contains Alice's current direct observation of Bob. `Information.peer_memory` contains historical observations identified by `last_observed_step`.
+
+When Bob is not visible, his current location and holdings are unknown. Historical observations and messages cannot override current direct observations.
+
+First-person progress, action history, and agent_control describe Alice, not Bob. Do not attribute Alice's actions or objects to Bob.
+
+## Input
+
+Information shared with the planner:
+$INFORMATION
+
+Prior aligned to current candidates:
+$PRIOR
+
+Public support (task -> exact allowed skill keys):
+$SUPPORT
+
+New legal events since the previous decision:
+$EVENTS
+
+Requests with linked reply IDs:
+$REQUESTS
+
+## Output
+
+Return only valid JSON with ALL support keys.
+
+Example structure:
+{"intent":{"task_probs":{"none":1},"skill_given_task":{"none":{"goexplore":1,"gocheck":1,"send_message":1,"idle":1}}},"delegation_responses":[]}
+
+Delegation response entry:
+{"request_event_id":"e00001","reply_event_id":"e00002","response":"accepted"}
+
+Allowed response values: `accepted`, `rejected`, `unclear`.

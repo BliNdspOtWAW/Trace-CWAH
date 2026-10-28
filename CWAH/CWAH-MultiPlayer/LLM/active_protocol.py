@@ -2,7 +2,7 @@
 import re
 
 FLAGS = re.I | re.S
-RESERVED = r'cot|message|action|subtask_id|communication_type|intention|new_subtask_id|reply'
+RESERVED = r'cot|message|action|subtask_id|communication_type|probe_target|intention|new_subtask_id|reply'
 
 
 def _take(text, tag):
@@ -20,7 +20,7 @@ def parse_trace_active(raw, available_actions):
     message, remaining = _take(remaining, 'message')
     action, remaining = _take(remaining, 'action')
     no_action = {'plan': None, 'think': think, 'message': None,
-                 'subtask_id': None, 'communication_type': None}
+                 'subtask_id': None, 'communication_type': None, 'probe_target': None}
     if not action:
         return no_action
     if not re.fullmatch(r'\(?[A-Z]\)?', action):
@@ -42,10 +42,12 @@ def parse_trace_active(raw, available_actions):
         raise ValueError('message contains internal protocol tags; retry with plain prose')
     task, remaining = _take(remaining, 'subtask_id')
     kind, remaining = _take(remaining, 'communication_type')
+    probe_target, remaining = _take(remaining, 'probe_target')
     if re.search(r'</?\s*(?:' + RESERVED + r')\b', remaining, FLAGS):
         raise ValueError('malformed or misplaced TRACE Active protocol field')
-    if not selected.startswith('[send_message]') and kind is not None:
-        raise ValueError('physical action cannot have a communication_type')
+    if not selected.startswith('[send_message]') and (kind is not None or probe_target is not None):
+        raise ValueError('physical action cannot have communication metadata')
     return {'plan': selected, 'think': think, 'message': message,
             'subtask_id': None if task in (None, '', 'null', 'None') else task,
-            'communication_type': kind, 'has_subtask_field': task is not None}
+            'communication_type': kind, 'probe_target': probe_target,
+            'has_subtask_field': task is not None}

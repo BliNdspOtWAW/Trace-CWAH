@@ -5,22 +5,13 @@ import pickle
 from pathlib import Path
 from .metrics import identity, validate_prior
 from .storage import data_directory
+from .online_inputs import extract_online_input
 
-VERSION = 'retrospective-intent-agreement-v2-scores'
+VERSION = 'retrospective-intent-agreement-v3-online-facts'
 INFO_FIELDS = ('planner_type', 'goal', 'current_progress', 'action_history',
                'dialogue_history', 'available_actions', 'step', 'current_skill',
                'incoming_message', 'public_tasks', 'agent_control',
                'peer_observation', 'peer_memory')
-EVENT_FIELDS = {
-    'observation': ('nodes', 'edges', 'location'),
-    'message': ('sender', 'receiver', 'kind', 'text', 'communication', 'reply_to'),
-    'own_action': ('action', 'status'),
-    'own_outcome': ('action', 'success', 'status', 'error'),
-    'task_completion': ('task', 'completed_by'),
-    'peer_task_progress': ('actor', 'status', 'observed_action', 'task'),
-    'peer_task_outcome': ('action', 'object', 'object_id', 'success', 'verified',
-                          'relation', 'target_id', 'target_class', 'task'),
-}
 
 
 def digest(value):
@@ -40,29 +31,12 @@ def find_traces(value, path='root'):
             yield from find_traces(child, path + '/' + str(i))
 
 
-def legal_event(event):
-    kind = event['kind']
-    if kind == 'decision':
-        return None
-    if kind not in EVENT_FIELDS:
-        raise ValueError('unknown evidence kind: ' + kind)
-    payload = event['payload']
-    if kind == 'observation':
-        # Geometry required for visible movement, excluding unnecessary scene metadata.
-        payload = dict(payload)
-        payload['nodes'] = [{k: n[k] for k in ('id', 'class_name', 'states', 'obj_transform') if k in n}
-                            for n in payload['nodes']]
-        payload['edges'] = [{k: e[k] for k in ('from_id', 'to_id', 'relation_type')}
-                            for e in payload['edges']]
-    return {'event_id': event['event_id'], 'step': event['step'], 'kind': kind,
-            'payload': {k: payload[k] for k in EVENT_FIELDS[kind] if k in payload}}
-
-
 def build_intervals(trace, trace_id):
     events, updates = trace['evidence_events'], trace['belief_updates']
     if len({e['event_id'] for e in events}) != len(events):
         raise ValueError('duplicate ledger event IDs')
     last_cursor, last_id = 0, 0
+    recovered = {}
     for update in updates:
         start, end = update['interval_start_cursor'], update['interval_end_cursor']
         if not (type(start) is int and type(end) is int and
@@ -75,6 +49,10 @@ def build_intervals(trace, trace_id):
         expected = [e['event_id'] for e in events[start:end - 1]]
         if expected != update['new_event_ids']:
             raise ValueError('decision evidence cursor mismatch')
+        raw_events = events[start:end - 1]
+        if update.get('legal_interval_events') != raw_events:
+            raise ValueError('saved legal interval differs from raw ledger slice')
+        recovered[update['decision_id']] = extract_online_input(update, raw_events)
         last_cursor, last_id = end, update['decision_id']
     for current, following in zip(updates, updates[1:]):
         end = current['interval_end_cursor']
@@ -89,20 +67,30 @@ def build_intervals(trace, trace_id):
             raise ValueError('saved prior support mismatch')
         values = {identity(c): c['probability'] for c in saved}
         prior = validate_prior([values[k] for k in keys])
-        history = [legal_event(e) for e in events[:end]]
-        evidence = [legal_event(e) for e in events[end:next_end]]
-        evidence = [e for e in evidence if e is not None]
+        start_input = recovered[current['decision_id']]
+        next_input = recovered[following['decision_id']]
+        start_facts = {k: start_input['information'][k] for k in INFO_FIELDS
+                       if k in start_input['information']}
+        end_facts = {k: next_input['information'][k] for k in INFO_FIELDS
+                     if k in next_input['information']}
+        # Facts newly available at the next boundary (e.g. public task creation)
+        # can be in Information rather than the event list. Include changed factual
+        # fields, but never the next posterior, belief snapshot or instructions.
+        changed_facts = {k: value for k, value in end_facts.items()
+                         if k not in start_facts or start_facts[k] != value}
+        evidence = next_input['events']
         common = {
             'target': 'Bob Intent at START decision; not end decision',
             'start_decision_id': current['decision_id'],
             'end_decision_id': following['decision_id'],
             'candidates': candidates,
             'history': {
-                'start_information': {k: current['shared_information'][k] for k in INFO_FIELDS
-                                      if k in current['shared_information']},
-                'legal_events': [e for e in history if e is not None],
+                'start_information': start_facts,
+                'start_formatted_events': start_input['events'],
+                'start_request_facts': start_input['request_facts'],
             },
             'new_evidence': evidence,
+            'new_information': changed_facts,
         }
         row = {'interval_id': f"{trace_id}:{current['decision_id']}:{following['decision_id']}",
                'common': common, 'common_hash': digest(common), 'prior': prior,
@@ -110,6 +98,15 @@ def build_intervals(trace, trace_id):
                'start_planner': current['planner_type'], 'end_planner': following['planner_type'],
                'event_cursor_start': end, 'event_cursor_stop': next_end,
                'new_event_count': len(evidence),
+               'audit': {
+                   'start_raw_event_ids': current['new_event_ids'],
+                   'new_raw_event_ids': following['new_event_ids'],
+                   'start_online_prompt_sha256': hashlib.sha256(start_input['prompt'].encode()).hexdigest(),
+                   'end_online_prompt_sha256': hashlib.sha256(next_input['prompt'].encode()).hexdigest(),
+                   'start_formatted_events_hash': digest(start_input['events']),
+                   'new_formatted_events_hash': digest(evidence),
+                   'common_input_chars': len(json.dumps(common, ensure_ascii=False)),
+               },
                'intent_update_status': current.get('intent_update_status')}
         row['input_hash'] = digest(row)
         yield row
@@ -138,7 +135,10 @@ def prepare(source, output):
                                                 for r in rows), encoding='utf-8')
     manifest = {'protocol': VERSION, 'source': str(source), 'source_sha256': hashlib.sha256(raw).hexdigest(),
                 'interval_count': len(rows), 'terminal_tails': tails,
-                'history_policy': 'full ordered legal ledger plus whitelisted start snapshot; no truncation',
+                'history_policy': 'saved online factual input at start + next online formatted events + changed factual fields; no full-ledger expansion',
+                'raw_evidence_policy': 'event IDs/cursors and source SHA256 reference the original trajectory',
+                'common_input_chars': {'min': min((r['audit']['common_input_chars'] for r in rows), default=0),
+                                       'max': max((r['audit']['common_input_chars'] for r in rows), default=0)},
                 'ground_truth': 'not required; JSD measures agreement, not accuracy'}
     (details / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
     return manifest

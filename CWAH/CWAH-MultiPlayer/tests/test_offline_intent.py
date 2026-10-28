@@ -13,6 +13,26 @@ from offline_intent.metrics import bayes, jsd, parse_scores
 from offline_intent.report import report
 
 
+def seal_trace(trace):
+    """Construct a faithful saved online prompt for small scripted archives."""
+    from offline_intent.online_inputs import SECTIONS
+    for update in trace['belief_updates']:
+        raw = trace['evidence_events'][update['interval_start_cursor']:update['interval_end_cursor'] - 1]
+        update['legal_interval_events'] = copy.deepcopy(raw)
+        formatted = copy.deepcopy(raw)
+        for event in formatted:
+            if event['kind'] == 'observation':
+                event['payload'] = {'peer_observation': {'step': event['step'], 'visible': False,
+                                                        'state': None},
+                                    'semantic_peer_facts': ['Bob is not currently visible']}
+        values = [update['shared_information'], {'ONLINE_PRIOR_SECRET': 0.123},
+                  update['support'], formatted,
+                  update.get('test_requests', [])]
+        update['llm_call'] = {'prompt': 'Online instructions, not offline input.\n' + '\n'.join(
+            marker + '\n' + json.dumps(value) for (_, marker), value in zip(SECTIONS, values))}
+    return trace
+
+
 def fixture():
     candidates = [{'subtask_id': 'S1', 'skill': 'gograb'}, {'subtask_id': 'none', 'skill': 'idle'}]
     events = [
@@ -30,7 +50,7 @@ def fixture():
                 'posterior': {'joint': [dict(c, probability=p) for c, p in zip(candidates, [0.75, 0.25])]},
                 'shared_information': {'goal': 'move apple', 'belief_before': 'PRIOR_SECRET', 'full_graph': 'PRIVATE'},
                 'llm_call': {'prompt': 'PRIVATE_PROMPT'}}
-    return {'evidence_events': events, 'belief_updates': [update(1, 0, 2), update(2, 2, 4)]}
+    return seal_trace({'evidence_events': events, 'belief_updates': [update(1, 0, 2), update(2, 2, 4)]})
 
 
 def response(values, field='likelihoods'):
@@ -98,11 +118,51 @@ class OfflineIntentTests(unittest.TestCase):
         self.assertEqual(result['branches']['B']['normalization'], 'score_only')
         self.assertGreater(result['jsd_bits'], 0)
 
+    def test_exact_online_facts_include_start_events_and_request_text(self):
+        trace = fixture()
+        trace['belief_updates'][0]['test_requests'] = [{
+            'request_event_id': 'older', 'reply_event_id': 'reply',
+            'request_event_text': 'Please do S1.', 'reply_event_text': 'I accept.',
+            'status': 'ACCEPTANCE_BELIEF_MUST_NOT_LEAK'}]
+        row = next(build_intervals(seal_trace(trace), 'episode'))
+        history = row['common']['history']
+        self.assertEqual(history['start_formatted_events'][0]['event_id'], 'e0')
+        self.assertEqual(history['start_request_facts'][0]['reply_event_text'], 'I accept.')
+        for forbidden in ('ONLINE_PRIOR_SECRET', 'ACCEPTANCE_BELIEF_MUST_NOT_LEAK',
+                          'PRIVATE', 'FUTURE_DO_NOT_READ'):
+            self.assertNotIn(forbidden, prompt_for(row, 'A'))
+        self.assertNotIn('nodes', json.dumps(row['common']))
+
+    def test_saved_prompt_mismatch_or_missing_prompt_is_rejected(self):
+        from offline_intent.online_inputs import extract_online_input
+        trace = fixture()
+        update = trace['belief_updates'][0]
+        update['llm_call']['prompt'] = ''
+        with self.assertRaisesRegex(ValueError, 'saved online updater prompt'):
+            list(build_intervals(trace, 'episode'))
+        trace = fixture()
+        trace['belief_updates'][0]['shared_information']['goal'] = 'tampered'
+        with self.assertRaisesRegex(ValueError, 'information differs'):
+            list(build_intervals(trace, 'episode'))
+        trace = fixture()
+        trace['belief_updates'][1]['legal_interval_events'] = []
+        with self.assertRaisesRegex(ValueError, 'saved legal interval differs'):
+            list(build_intervals(trace, 'episode'))
+
+    def test_new_public_facts_preserved_without_end_posterior(self):
+        trace = fixture()
+        trace['belief_updates'][1]['shared_information']['public_tasks'] = {'S2': {'status': 'active'}}
+        trace['belief_updates'][1]['posterior']['joint'][0]['probability'] = 0.123456789
+        row = next(build_intervals(seal_trace(trace), 'episode'))
+        self.assertEqual(row['common']['new_information']['public_tasks'], {'S2': {'status': 'active'}})
+        self.assertNotIn('0.123456789', prompt_for(row, 'A'))
+        self.assertEqual(row['audit']['new_raw_event_ids'], ['e2'])
+
     def test_corrupt_cursor_rejected(self):
         trace = fixture()
         trace['belief_updates'][1]['interval_start_cursor'] = 1
         with self.assertRaises(ValueError):
-            list(build_intervals(trace, 'episode'))
+            list(build_intervals(seal_trace(trace), 'episode'))
 
     def test_all_observation_frames_preserved_and_empty_intervals_allowed(self):
         trace = fixture()
@@ -112,12 +172,12 @@ class OfflineIntentTests(unittest.TestCase):
         trace['evidence_events'].insert(3, observation)
         trace['belief_updates'][1]['interval_end_cursor'] = 5
         trace['belief_updates'][1]['new_event_ids'].append('extra')
-        row = next(build_intervals(trace, 'episode'))
+        row = next(build_intervals(seal_trace(trace), 'episode'))
         self.assertEqual([e['event_id'] for e in row['common']['new_evidence']], ['e2', 'extra'])
         trace = fixture()
         trace['evidence_events'].pop(2)
         trace['belief_updates'][1].update(interval_end_cursor=3, new_event_ids=[])
-        row = next(build_intervals(trace, 'episode'))
+        row = next(build_intervals(seal_trace(trace), 'episode'))
         self.assertEqual(row['common']['new_evidence'], [])
 
     def test_report_pending_and_failed_never_zero(self):
@@ -142,7 +202,7 @@ class OfflineIntentTests(unittest.TestCase):
         update['support']['none'] = ['goexplore', 'gocheck', 'send_message', 'idle']
         update['posterior']['joint'] = [dict(subtask_id=t, skill=s, probability=1/22)
                                         for t, skills in update['support'].items() for s in skills]
-        row = next(build_intervals(trace, 'episode'))
+        row = next(build_intervals(seal_trace(trace), 'episode'))
         self.assertEqual(len(row['prior']), 22)
         self.assertEqual(len(json.loads(prompt_for(row, 'A').split('\nINPUT:\n')[1])['candidates']), 22)
 

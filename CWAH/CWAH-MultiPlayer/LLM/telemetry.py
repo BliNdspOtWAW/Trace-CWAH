@@ -28,6 +28,17 @@ def _emit(record):
         warnings.warn('LLM metrics write failed: ' + type(exc).__name__, RuntimeWarning)
 
 
+def record_decision(planner, module, valid, reason=None):
+    """Record protocol validity separately from the completed API request."""
+    call = getattr(planner, 'last_call_metrics', None) or {}
+    if call.get('module') != module or not call.get('call_id'):
+        return
+    _emit({'schema_version': 1, 'event': 'decision_end', 'call_id': call['call_id'],
+           'module': module, 'status': 'ok' if valid else 'error',
+           'reason': None if valid else str(reason or 'invalid_output'),
+           'ended_at': datetime.now(timezone.utc).isoformat()})
+
+
 def measured_generate(planner, request, params, module, information=None, sections=None, counts=None):
     """Return exactly generator(request, params); log completed and failed calls.
 
@@ -71,6 +82,7 @@ def measured_generate(planner, request, params, module, information=None, sectio
     started = time.monotonic()
     error = None
     outputs = None
+    planner.last_api_response_status = None
     try:
         outputs, cost = planner.generator(request, params)
         return outputs, cost
@@ -80,7 +92,9 @@ def measured_generate(planner, request, params, module, information=None, sectio
     finally:
         record.update(event='call_end', ended_at=datetime.now(timezone.utc).isoformat(),
                       elapsed_seconds=time.monotonic() - started,
-                      status='error' if error else 'ok', error_type=error)
+                      status='error' if error else 'ok', error_type=error,
+                      api_status=(getattr(planner, 'last_api_response_status', None)
+                                  or ('error' if error else 'ok')))
         usage = getattr(planner, 'last_usage_metadata', None)
         usage = usage if isinstance(usage, dict) and not error else {}
         known = usage.get('token_usage_available', True)

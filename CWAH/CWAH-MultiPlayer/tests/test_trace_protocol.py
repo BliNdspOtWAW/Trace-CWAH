@@ -16,6 +16,12 @@ TASK = {'subtask_id': 'S1', 'status': 'active', 'created_step': 0,
 
 
 class TraceProtocolTests(unittest.TestCase):
+    def test_thinking_output_without_legal_final_action_is_rejected(self):
+        p = self.planner('Analysis exhausted the answer budget.')
+        p.chat_enable_thinking = True
+        with self.assertRaisesRegex(ValueError, 'no legal final action'):
+            self.run_planner(p)
+
     def planner(self, output):
         p = LLM.__new__(LLM)
         p.prompt_template = '$GOAL\n$PROGRESS\n$STEP\n$ACTION_HISTORY\n$ASSIGNED_PERSONALITY\n$DIALOGUE_HISTORY\n$TRACE_BELIEF\n$ACTIONS_REFINE'
@@ -39,23 +45,34 @@ class TraceProtocolTests(unittest.TestCase):
         return p.run(None, {}, [], [], {}, {}, None, [], [], [], None,
                      belief_context=context, decision_information=information)
 
-    def output(self, kind=None, task='S1'):
+    def output(self, kind=None, task='S1', target='auto'):
+        if target == 'auto':
+            target = 'intent' if kind == 'probe' else None
         return ('<cot>coordinate</cot><message>Please complete S1.</message>'
                 '<action>[send_message]</action><subtask_id>{}</subtask_id>'.format(task)
-                + ('<communication_type>{}</communication_type>'.format(kind) if kind else ''))
+                + ('<communication_type>{}</communication_type>'.format(kind) if kind else '')
+                + ('<probe_target>{}</probe_target>'.format(target) if target is not None else ''))
 
     def test_trace_active_parser_requires_typed_communication(self):
-        for kind, task in [('delegate', 'S1'), ('probe_intent', 'null')]:
+        for kind, task in [('delegate', 'S1'), ('probe', 'null')]:
             plan, result = self.run_planner(self.planner(self.output(kind, task)))
             self.assertTrue(plan.startswith('[send_message]'))
             self.assertEqual(result['trace_communication']['type'], kind)
-        for kind, task in [(None, 'S1'), ('other', 'S1'), ('delegate', 'null'), ('probe_intent', 'S1')]:
+            if kind == 'probe':
+                self.assertEqual(result['trace_communication']['probe_target'], 'intent')
+        for kind, task in [(None, 'S1'), ('other', 'S1'), ('delegate', 'null'),
+                           ('probe', 'S1'), ('probe_intent', 'null')]:
             with self.subTest(kind=kind, task=task), self.assertRaises(ValueError):
                 self.run_planner(self.planner(self.output(kind, task)))
+        for raw in (self.output('probe', 'null', None),
+                    self.output('probe', 'null', 'other'),
+                    self.output('delegate', 'S1', 'intent')):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                self.run_planner(self.planner(raw))
 
     def test_trace_final_contract_and_retry_feedback(self):
         p = self.planner(self.output('delegate'))
-        p.active_retry_error = 'TRACE-v2 send_message requires delegate or probe_intent'
+        p.active_retry_error = 'TRACE-v2 send_message requires delegate or probe'
         _, result = self.run_planner(p)
         prompt = result['raw_prompt']
         self.assertIn('FINAL TRACE OUTPUT CONTRACT', prompt)

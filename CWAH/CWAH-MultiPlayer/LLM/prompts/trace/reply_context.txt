@@ -1,0 +1,5 @@
+## TRACE Teammate Belief
+
+$TRACE_BELIEF
+
+Intent is a joint estimate of Bob's current macro-subtask and executing skill. Capability and Reliability are estimates from public outcomes and accepted assignments; their parameter uncertainty is not failure probability. Interpret the belief alongside recent observations and dialogue when deciding how to respond or coordinate later.

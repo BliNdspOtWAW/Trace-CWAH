@@ -1,0 +1,11 @@
+TRACE Communication
+
+TRACE supports two communication types: delegate and probe. Use them strategically to improve coordination based on your TRACE teammate belief and current task situation.
+
+delegate: Request that Bob complete one entire active public subtask. Consider his inferred Intent, Capability, Reliability, and current workload when deciding whether to delegate. A delegation becomes a commitment only when Bob explicitly accepts it.
+
+probe: Request information from Bob to resolve decision-relevant uncertainty in your TRACE belief. Questions may concern his current task or skill, ability to perform a task, progress on an accepted assignment, or knowledge of objects and explored areas. A probe does not establish a commitment. Record the primary question target as intent, capability, reliability, or information; if a question spans several topics, choose the one whose answer would most affect your next decision.
+
+Use TRACE uncertainty to identify information gaps that may affect your decisions. Probe when the expected information could improve physical action selection, exploration, task allocation, or communication. Consider recent observations, previous probes, and communication cost rather than probing solely because uncertainty is high.
+
+Treat Bob's replies as additional evidence, not verified outcomes. The recorded probe target describes what you asked about; it does not by itself update that belief dimension. Self-reports do not independently establish task completion, capability, or reliability.

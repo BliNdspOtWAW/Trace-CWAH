@@ -1,6 +1,7 @@
 from LLM import *
 import copy
 from LLM.communication import CommunicationModule
+from LLM.telemetry import record_decision
 from trace_tf.updater import HybridUpdater
 from trace_tf.peer_observation import PeerStateTracker
 from trace_tf.policy import render_policy_context, render_reply_context
@@ -362,6 +363,7 @@ class LLM_agent(TaskControl):
 				except ValueError as exc:
 					info.setdefault('planning_errors', []).append(str(exc))
 					self.LLM.active_retry_error = str(exc)
+					record_decision(self.LLM, 'active', False, exc)
 					continue
 				if plan is None:
 					# A parsed empty action consumes this step without a physical/message
@@ -524,6 +526,7 @@ class LLM_agent(TaskControl):
 			call['macro_changed'] = self.apply_reactive_target(call.get('new_subtask_id'))
 		except ValueError as exc:
 			call['control_error'] = str(exc)
+			record_decision(self.LLM, 'reactive', False, exc)
 			exc.call = call
 			raise
 		call.update({

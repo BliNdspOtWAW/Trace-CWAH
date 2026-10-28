@@ -24,6 +24,10 @@ def _stats(values):
 
 def _aggregate(rows):
     return dict(calls=len(rows), generation_errors=sum(r.get('status') == 'error' for r in rows),
+                api_success_calls=sum(r.get('api_status', r.get('status')) == 'ok' for r in rows),
+                valid_decision_calls=sum(r.get('decision_status') == 'ok' for r in rows),
+                invalid_decision_calls=sum(r.get('decision_status') == 'error' for r in rows),
+                unreported_decision_calls=sum(r.get('decision_status') is None for r in rows),
                 missing_token_usage_calls=sum(r.get('prompt_tokens') is None for r in rows),
                 metrics={name: _stats([r.get(name) for r in rows]) for name in NUMBERS})
 
@@ -35,7 +39,7 @@ def export_metrics(run_dir):
         source = run_dir / 'llm_calls.jsonl'  # Read-only compatibility with older runs.
     if not source.is_file():
         return {'available': False}
-    starts, ends, invalid, reported_steps = {}, {}, 0, 0
+    starts, ends, decisions, invalid, reported_steps = {}, {}, {}, 0, 0
     with source.open(encoding='utf-8') as stream:
         for line in stream:
             try:
@@ -47,9 +51,18 @@ def export_metrics(run_dir):
                 starts[row['call_id']] = row
             elif row.get('event') == 'call_end':
                 ends[row['call_id']] = row
+            elif row.get('event') == 'decision_end':
+                decisions[row['call_id']] = row
             elif row.get('event') == 'environment_step_start':
                 reported_steps += 1
-    rows = list(ends.values())
+    rows = []
+    for call_id, call in ends.items():
+        row = dict(call)
+        decision = decisions.get(call_id)
+        if decision:
+            row['decision_status'] = decision.get('status')
+            row['decision_reason'] = decision.get('reason')
+        rows.append(row)
     in_flight = []
     for call_id in sorted(set(starts) - set(ends)):
         item = dict(starts[call_id])

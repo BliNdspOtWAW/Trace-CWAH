@@ -1,0 +1,17 @@
+## Output Requirements
+
+Output one available action and its associated <subtask_id>. Use an active public task ID for task-specific actions, or null for task-independent exploration or communication. Grab/put actions must match the selected task's object and destination.
+
+For physical actions, leave <message> empty. For [send_message], provide a concise message. Keep all output fields at the top level; do not put control tags inside <cot> or <message>. Use the exact physical action text, including its object IDs and parameters, from the available list.
+
+**Physical action:**
+<cot>Brief reason for the action.</cot>
+<message></message>
+<action>Exactly one available physical action.</action>
+<subtask_id>Active task ID or null.</subtask_id>
+
+**Communication:**
+<cot>Brief reason for the message.</cot>
+<message>Concise message to your teammate.</message>
+<action>[send_message]</action>
+<subtask_id>Active task ID or null.</subtask_id>

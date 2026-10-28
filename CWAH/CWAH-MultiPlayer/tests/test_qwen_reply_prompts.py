@@ -9,15 +9,14 @@ from run_experiment import _reply_prompt_path
 
 
 class QwenReplyPromptTests(unittest.TestCase):
-    def test_local_qwen_uses_role_specific_formatting_prompt(self):
+    def test_local_qwen_uses_standard_role_reply_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / 'config.json').write_text(json.dumps({'model_type': 'qwen3'}))
             for role in ('alice', 'bob'):
                 path = _reply_prompt_path('huggingface', directory, role)
-                self.assertEqual(path.name, f'prompt_Reply_Qwen_{role.title()}.txt')
-                original = path.with_name(f'prompt_Reply_{role.title()}.txt').read_text()
-                self.assertEqual(path.read_text().split('\nFormatting requirements:')[0], original.rstrip() + '\n')
-                self.assertIn('literal closing tag </reply>', path.read_text())
+                self.assertEqual(path.name, f'prompt_Reply_{role.title()}.txt')
+                self.assertIn('<new_subtask_id>', path.read_text())
+                self.assertIn('</reply>', path.read_text())
 
     def test_api_models_keep_original_prompts(self):
         self.assertEqual(_reply_prompt_path('openai', 'gpt-5.6-sol', 'alice').name,

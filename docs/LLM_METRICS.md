@@ -67,8 +67,14 @@ Compare the SAME Agent/module in early versus late 50-step windows:
   non-LLM overhead can slow a run even when per-call prompt sizes are stable.
   Step intervals include planning/execution; they are not isolated Unity time.
 
-`status=ok` means the generator returned, not that its action/JSON was valid or
-the task succeeded. Existing parser/error logs remain necessary. No inference
+`call_end.status=ok` means generation returned; `call_end.api_status=ok` means the
+Chat API returned successfully, even if the answer was truncated or malformed.
+`decision_end.status=ok` requires a valid action, Reactive reply, or TRACE intent
+distribution. The summary reports `api_success_calls`, `valid_decision_calls`,
+`invalid_decision_calls`, and `unreported_decision_calls` separately. A missing
+decision record in older runs is unknown, not an invalid decision. `decision_end.reason`
+records protocol or probability failures without storing prompt or reply text.
+No inference
 about context being the cause should rely on latency alone: compare input,
 output/reasoning tokens, retries and cache behavior together.
 
