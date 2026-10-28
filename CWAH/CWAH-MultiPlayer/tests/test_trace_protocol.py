@@ -37,13 +37,41 @@ class TraceProtocolTests(unittest.TestCase):
         p.generator = Mock(return_value=([output], 0))
         return p
 
-    def run_planner(self, p, task='S1', trace=True):
-        context = 'TRACE-v2 teammate belief about Bob' if trace else ''
+    def run_planner(self, p, task='S1', trace=True, actions=('[send_message]',), context=None):
+        if context is None:
+            context = 'TRACE-v2 teammate belief about Bob' if trace else ''
         information = DecisionInformation(planner_type='active', goal='place apple', personality='',
-            current_progress='', available_actions=('[send_message]',),
-            available_actions_with_distance=('[send_message]',), public_tasks={'S1': TASK})
+            current_progress='', available_actions=actions,
+            available_actions_with_distance=actions, public_tasks={'S1': TASK})
         return p.run(None, {}, [], [], {}, {}, None, [], [], [], None,
                      belief_context=context, decision_information=information)
+
+    def test_wait_is_explicit_and_has_no_subtask(self):
+        actions = ('[send_message]', '[wait]')
+        for trace in (False, True):
+            raw = ('<cot>No useful action this step.</cot><message></message>'
+                   '<action>[wait]</action><subtask_id>null</subtask_id>')
+            plan, result = self.run_planner(self.planner(raw), trace=trace, actions=actions)
+            self.assertEqual(plan, '[wait]')
+            self.assertIsNone(result['selected_subtask_id'])
+            self.assertEqual(result['action_parse_status'], 'wait')
+            self.assertIn('[wait]', result['raw_prompt'])
+            for invalid in ('<subtask_id>S1</subtask_id>',
+                            '<subtask_id>null</subtask_id><message>hello</message>'):
+                bad = '<action>[wait]</action>' + invalid
+                with self.subTest(trace=trace, invalid=invalid), self.assertRaisesRegex(ValueError, 'requires null'):
+                    self.run_planner(self.planner(bad), trace=trace, actions=actions)
+
+    def test_high_intent_entropy_injects_prompt_and_records_gate(self):
+        output = ('<cot>Act directly.</cot><message></message>'
+                  '<action>[wait]</action><subtask_id>null</subtask_id>')
+        for entropy, expected in ((0.85, False), (0.86, True)):
+            context = json.dumps({'intent': {'value': {'normalized_entropy': entropy}}})
+            _, result = self.run_planner(self.planner(output), actions=('[wait]',), context=context)
+            self.assertEqual(result['intent_normalized_entropy'], entropy)
+            self.assertEqual(result['counterfactual_probe_threshold'], 0.85)
+            self.assertEqual(result['counterfactual_probe_prompt_injected'], expected)
+            self.assertEqual('Counterfactual Probe Check' in result['raw_prompt'], expected)
 
     def output(self, kind=None, task='S1', target='auto'):
         if target == 'auto':

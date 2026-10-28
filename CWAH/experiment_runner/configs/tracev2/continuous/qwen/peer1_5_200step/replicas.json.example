@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "replicas": [
+    {
+      "id": "ppu12",
+      "api_base": "http://127.0.0.1:18044/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu14",
+      "api_base": "http://127.0.0.1:18046/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu15",
+      "api_base": "http://127.0.0.1:18047/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu6",
+      "api_base": "http://127.0.0.1:18038/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu0",
+      "api_base": "http://127.0.0.1:18032/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu1",
+      "api_base": "http://127.0.0.1:18033/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu2",
+      "api_base": "http://127.0.0.1:18034/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu3",
+      "api_base": "http://127.0.0.1:18035/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu4",
+      "api_base": "http://127.0.0.1:18036/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu5",
+      "api_base": "http://127.0.0.1:18037/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu9",
+      "api_base": "http://127.0.0.1:18041/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu10",
+      "api_base": "http://127.0.0.1:18042/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    },
+    {
+      "id": "ppu11",
+      "api_base": "http://127.0.0.1:18043/v1",
+      "models": [
+        "qwen3.8-27b"
+      ],
+      "max_experiments": 1
+    }
+  ]
+}

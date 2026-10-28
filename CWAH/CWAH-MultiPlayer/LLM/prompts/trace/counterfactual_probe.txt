@@ -1,0 +1,5 @@
+Counterfactual Probe Check
+
+Your current normalized joint intent entropy for Bob is $INTENT_ENTROPY, so there is substantial uncertainty about Bob's current task-skill state. Before choosing an action, identify the single piece of information about Bob that would matter most to your immediate decision. Compare plausible answers: would knowing which answer is true change the action you choose now? If so, would that change meaningfully reduce duplicated work, conflict, or execution cost enough to justify spending a step asking?
+
+Choose a concrete probe only when both the action change and its likely benefit are clear. Ask a specific question with the appropriate probe_target. Otherwise choose the best available physical action, delegation, or wait without probing. High entropy alone is not a reason to probe. Avoid repeating a question that Bob has already answered unless new evidence makes the answer stale.

@@ -1,0 +1,56 @@
+{
+  "dataset": {
+    "path": "CWAH/dataset-candidates/wah/test_env_set_help.pik",
+    "episode_index": 44
+  },
+  "bob_profile": {
+    "id": "peer3_Self-Directed",
+    "text_file": "CWAH/experiment_runner/profiles/tracev2/peer3_Self-Directed.txt"
+  },
+  "trace_mode": "off",
+  "continuous_subtasks": {
+    "enabled": true,
+    "active_count": 3,
+    "seed": 1,
+    "generation_mode": "state_based",
+    "max_generation_attempts": 64,
+    "reverse_cooldown_steps": 20,
+    "targets": [
+      {
+        "relation": "on",
+        "object_id": 72,
+        "object_class": "kitchentable",
+        "capacity": 6
+      },
+      {
+        "relation": "on",
+        "object_id": 268,
+        "object_class": "coffeetable",
+        "capacity": 5
+      },
+      {
+        "relation": "on",
+        "object_id": 213,
+        "object_class": "desk",
+        "capacity": 5
+      },
+      {
+        "relation": "inside",
+        "object_id": 103,
+        "object_class": "fridge",
+        "capacity": 6
+      }
+    ]
+  },
+  "alice_model": "qwen3.8-27b",
+  "bob_model": "qwen3.8-27b",
+  "temperature": 0,
+  "max_tokens": 1024,
+  "max_episode_length": 200,
+  "num_runs": 1,
+  "port": "auto",
+  "executable_file": "CWAH/executable/linux_exec.v2.3.0.x86_64",
+  "backend": "openai",
+  "results_root": "CWAH/experiments/tracev2",
+  "experiment_label": "peer3_200step_qwen"
+}

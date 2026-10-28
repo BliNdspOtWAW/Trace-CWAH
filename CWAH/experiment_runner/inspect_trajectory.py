@@ -133,7 +133,7 @@ def render_run(run, *, include_prompts=False, full_trace=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('trajectory', type=Path, help='Trusted local trajectory.pik')
+    parser.add_argument('trajectory', type=Path, help='Trusted local trajectory .pik file')
     parser.add_argument('--run-index', type=int, help='Render one repeat (default: all)')
     parser.add_argument('--include-prompts', action='store_true',
                         help='Include full prompts, decision information, and raw evidence')

@@ -11,7 +11,8 @@ from trace_tf.information import DecisionInformation
 from trace_tf.peer_observation import render_peer_context
 from .responses_client import generate_responses
 from .active_protocol import parse_trace_active
-from .prompt_composer import compose_active, trace_enabled
+from .prompt_composer import (COUNTERFACTUAL_PROBE_ENTROPY_THRESHOLD,
+                              compose_active, counterfactual_probe_prompt, trace_enabled)
 from .telemetry import measured_generate, record_decision
 
 csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwah.csv")
@@ -620,6 +621,7 @@ class LLM:
         plans = ""
         plans_refine = ""
         available_plans.append(f"[send_message]")
+        available_plans.append("[wait]")
         available_plans_refine = available_plans.copy()
 
         for i, plan in enumerate(available_plans):
@@ -653,7 +655,11 @@ class LLM:
         progress_desc = information.current_progress
         action_history_desc = ", ".join(information.action_history) or 'None'
         dialogue_history_desc = '\n'.join(information.dialogue_history) or 'None'
-        prompt = compose_active(self.prompt_template, belief_context).replace('$GOAL', information.goal)
+        intent_entropy, probe_prompt = counterfactual_probe_prompt(belief_context, self.agent_name)
+        info['intent_normalized_entropy'] = intent_entropy
+        info['counterfactual_probe_threshold'] = COUNTERFACTUAL_PROBE_ENTROPY_THRESHOLD
+        info['counterfactual_probe_prompt_injected'] = bool(probe_prompt)
+        prompt = compose_active(self.prompt_template, belief_context, probe_prompt).replace('$GOAL', information.goal)
         prompt = prompt.replace('$PROGRESS', progress_desc)
         prompt = prompt.replace('$STEP', str(information.step))
         prompt = prompt.replace('$ACTION_HISTORY', action_history_desc)
@@ -692,6 +698,7 @@ class LLM:
                 'goal': information.goal, 'progress': progress_desc,
                 'action_history': action_history_desc, 'dialogue_history': dialogue_history_desc,
                 'available_actions': available_plans_refine, 'trace_belief': belief_context,
+                'counterfactual_probe': probe_prompt,
             })
         output = outputs[0]
         import re
@@ -725,6 +732,10 @@ class LLM:
             plan, think, message = (trace_protocol[key] for key in ('plan', 'think', 'message'))
         else:
             plan,think, message = self.parse_answer(available_plans_list_refine, output)
+        if plan == '[wait]':
+            if info['selected_subtask_id'] is not None or message:
+                raise ValueError('[wait] requires null subtask_id and an empty message')
+            info['action_parse_status'] = 'wait'
         if plan is None:
             if getattr(self, 'chat_thinking_active',
                        getattr(self, 'chat_enable_thinking', False)):

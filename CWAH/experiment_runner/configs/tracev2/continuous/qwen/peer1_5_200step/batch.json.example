@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "batch_id": "qwen_peer1_5_200step_v1",
+  "limits": {
+    "max_experiments": 3,
+    "max_unity_instances": 3
+  },
+  "max_attempts": 1,
+  "jobs": [
+    {
+      "id": "peer1_baseline",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer1_200step_qwen_baseline.json"
+    },
+    {
+      "id": "peer1_trace",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer1_200step_qwen_trace.json"
+    },
+    {
+      "id": "peer2_baseline",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer2_200step_qwen_baseline.json"
+    },
+    {
+      "id": "peer2_trace",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer2_200step_qwen_trace.json"
+    },
+    {
+      "id": "peer3_baseline",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer3_200step_qwen_baseline.json"
+    },
+    {
+      "id": "peer3_trace",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer3_200step_qwen_trace.json"
+    },
+    {
+      "id": "peer4_baseline",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer4_200step_qwen_baseline.json"
+    },
+    {
+      "id": "peer4_trace",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer4_200step_qwen_trace.json"
+    },
+    {
+      "id": "peer4_no_counterfactual",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer4_200step_qwen_trace.json",
+      "no_counterfactual": true
+    },
+    {
+      "id": "peer5_baseline",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer5_200step_qwen_baseline.json"
+    },
+    {
+      "id": "peer5_trace",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer5_200step_qwen_trace.json"
+    },
+    {
+      "id": "peer5_no_counterfactual",
+      "config": "CWAH/experiment_runner/configs/tracev2/continuous/qwen/peer1_5_200step/peer5_200step_qwen_trace.json",
+      "no_counterfactual": true
+    }
+  ]
+}

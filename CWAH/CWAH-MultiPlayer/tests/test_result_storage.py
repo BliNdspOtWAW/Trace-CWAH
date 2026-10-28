@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'experiment_runner'
 import run_experiment
 
 
-FIVE = {'config.json', 'summary.json', 'calls.jsonl', 'trajectory.pik', 'console.log'}
+def five(root):
+    return {'config.json', 'summary.json', 'calls.jsonl', root.name + '.pik', 'console.log'}
 
 
 def dump(path, value):
@@ -64,8 +65,8 @@ class ResultStorageTests(unittest.TestCase):
             original = finished_raw(root)
             evaluation(root, 1)
             self.assertEqual(self.finish(root), 0)
-            self.assertEqual({p.name for p in root.iterdir()}, FIVE)
-            with (root / 'trajectory.pik').open('rb') as stream:
+            self.assertEqual({p.name for p in root.iterdir()}, five(root))
+            with (root / (root.name + '.pik')).open('rb') as stream:
                 archive = pickle.load(stream)
             self.assertEqual(archive['runs'][0]['trace'], original['trace'])
             self.assertEqual(archive['runs'][0]['continuous_subtasks']['events'], original['continuous_subtasks']['events'])
@@ -84,13 +85,13 @@ class ResultStorageTests(unittest.TestCase):
             finished_raw(root, 1)
             evaluation(root, 2)
             self.assertEqual(self.finish(root, repeats=2), 0)
-            with (root / 'trajectory.pik').open('rb') as stream:
+            with (root / (root.name + '.pik')).open('rb') as stream:
                 archive = pickle.load(stream)
             self.assertEqual([r['run_index'] for r in archive['runs']], [0, 1])
             self.assertEqual(archive['runs'][0]['obs'][0], [{'visible_object': 0}])
             summary = json.loads((root / 'summary.json').read_text())
             self.assertEqual(summary['completed_subtasks'], 7)
-            self.assertEqual({p.name for p in root.iterdir()}, FIVE)
+            self.assertEqual({p.name for p in root.iterdir()}, five(root))
 
     def test_interrupt_keeps_checkpoint_and_partial_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -101,7 +102,7 @@ class ResultStorageTests(unittest.TestCase):
             summary = json.loads((root / 'summary.json').read_text())
             self.assertEqual(summary['status'], 'interrupted')
             self.assertTrue((root / 'trajectory_checkpoint.pik').is_file())
-            with (root / 'trajectory.pik').open('rb') as stream:
+            with (root / (root.name + '.pik')).open('rb') as stream:
                 self.assertTrue(pickle.load(stream)['runs'][0]['partial'])
 
     def test_failed_second_repeat_retains_both_runs(self):
@@ -112,7 +113,7 @@ class ResultStorageTests(unittest.TestCase):
             evaluation(root, 1)
             dump(root / '.runtime' / 'trajectory_checkpoint.pik', trajectory(1))
             self.assertEqual(self.finish(root, code=1, repeats=2), 1)
-            with (root / 'trajectory.pik').open('rb') as stream:
+            with (root / (root.name + '.pik')).open('rb') as stream:
                 runs = pickle.load(stream)['runs']
             self.assertEqual([r['run_index'] for r in runs], [0, 1])
             self.assertTrue(runs[1]['partial'])
@@ -145,8 +146,8 @@ class ResultStorageTests(unittest.TestCase):
             root = Path(directory)
             base_run(root)
             self.assertEqual(self.finish(root, code=1), 1)
-            self.assertEqual({p.name for p in root.iterdir()}, FIVE)
-            with (root / 'trajectory.pik').open('rb') as stream:
+            self.assertEqual({p.name for p in root.iterdir()}, five(root))
+            with (root / (root.name + '.pik')).open('rb') as stream:
                 self.assertEqual(pickle.load(stream)['runs'], [])
 
     def test_runner_uses_scratch_and_produces_five_files(self):
@@ -180,8 +181,10 @@ class ResultStorageTests(unittest.TestCase):
                                             'CWAH_HUMAN_API_BASE': 'https://example.invalid'}):
                 result = run_experiment._run_validated(config, selected, selected['episode'], 0, 6390)
             self.assertEqual(result, 0)
-            root = next((folder / 'CWAH/experiments/baseline').iterdir())
-            self.assertEqual({p.name for p in root.iterdir()}, FIVE)
+            group = folder / 'CWAH/experiments/other/test_none_2step/baseline'
+            root = next(group.iterdir())
+            self.assertTrue(root.name.startswith('test_none_2step_traceoff_'))
+            self.assertEqual({p.name for p in root.iterdir()}, five(root))
             events = [json.loads(line) for line in (root / 'calls.jsonl').read_text().splitlines()]
             self.assertEqual(events[0]['event'], 'environment_step_start')
 

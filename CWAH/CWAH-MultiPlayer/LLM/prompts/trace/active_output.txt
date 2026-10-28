@@ -4,6 +4,8 @@ Select exactly one available action and provide its associated <subtask_id>. Use
 
 For physical actions, leave <message> empty and omit <communication_type> and <probe_target>.
 
+Choose [wait] when there is no useful action or subtask to pursue this step. It consumes one environment step without moving or messaging. For [wait], use <subtask_id>null</subtask_id>, leave <message> empty, and omit <communication_type> and <probe_target>.
+
 For [send_message], use exactly one <communication_type> field: delegate with an exact active task ID, or probe with null subtask_id. A probe also requires exactly one <probe_target> field with one value from intent, capability, reliability, or information. Delegation must omit <probe_target>. Address the message to Bob in no more than 500 characters.
 
 All protocol fields must be top-level siblings, with each required field appearing exactly once. Do not put protocol tags inside <cot> or <message>; ordinary object labels such as <apple> (375) are allowed in prose.
@@ -27,4 +29,10 @@ All protocol fields must be top-level siblings, with each required field appeari
 <probe_target>information</probe_target>
 <message>Have you checked the kitchen cabinets for the apple?</message>
 <action>[send_message]</action>
+<subtask_id>null</subtask_id>
+
+**No action this step:**
+<cot>Brief reason for waiting.</cot>
+<message></message>
+<action>[wait]</action>
 <subtask_id>null</subtask_id>

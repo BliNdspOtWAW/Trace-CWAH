@@ -16,6 +16,12 @@ existing role template and baseline protocol.
 - TRACE: common body + `LLM/prompts/trace/planner_context.txt` and structured
   belief values + `trace/communication.txt` decision guidance +
   `trace/active_output.txt` protocol requirements.
+- When Alice's TRACE joint Intent entropy is strictly above 0.85, Active also
+  inserts `trace/counterfactual_probe.txt` between the belief guidance and action
+  selection. This asks whether an answer would change the next action and whether
+  that change is worth a probe; high entropy alone does not force a probe. The
+  decision record includes the entropy, threshold, and injection flag. Bob and
+  TRACE-off Active never receive this fragment.
 - Reactive: existing role-specific reply template and output format; TRACE adds belief
   values and `trace/reply_context.txt`, which contains the Reactive explanation.
   Baseline omits the optional TRACE section. Bob's reply template likewise omits
@@ -58,4 +64,4 @@ question, and linked reply are recorded for analysis, but the target label does
 not update a belief by itself. Probe replies may inform Intent inference;
 Capability and Reliability Beta counts still depend on public outcomes and
 accepted-task settlement. There is no separate structured information-gain or
-action-flip metric yet.
+action-flip metric yet; the counterfactual comparison is prompt guidance.

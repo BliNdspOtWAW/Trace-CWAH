@@ -58,6 +58,6 @@ Consider your teammate's messages, earlier agreements, and observed behavior. A 
 Available high-level actions:
 $ACTIONS_REFINE
 
-Select exactly one available action: a physical skill or [send_message]. Communication consumes one environment step. Share useful discoveries, progress, or a proposed division of work when it helps coordination and fits your personality; consider that cost against direct physical progress. Sending a message does not cancel an ongoing skill.
+Select exactly one available action: a physical skill, [send_message], or [wait]. Communication consumes one environment step. Share useful discoveries, progress, or a proposed division of work when it helps coordination and fits your personality; consider that cost against direct physical progress. Sending a message does not cancel an ongoing skill.
 
 $OUTPUT_CONTRACT

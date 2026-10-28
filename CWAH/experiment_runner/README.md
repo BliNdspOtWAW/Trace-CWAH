@@ -20,7 +20,8 @@
 | `configs/tracev1/`、`profiles/tracev1/` | 历史实验模板与画像。 |
 | `profiles/tracev2/` | 当前 Bob 行为画像，由 `bob_profile.text_file` 显式选择。 |
 | `metric_reports.py`、`result_storage.py` | 模型指标汇总、轨迹和结果归档。 |
-| `inspect_trajectory.py` | 从可信的 `trajectory.pik` 导出逐步可读文本。 |
+| `inspect_trajectory.py` | 从可信的 `.pik` 轨迹文件导出逐步可读文本。 |
+| `organize_results.py` | 仅整理 `experiments/tracev2/` 中的已有结果；默认预览，`--apply` 执行。 |
 | `render_prompt_flow.py` | 展开当前静态 Prompt 组合供审阅。 |
 | `compare_intent_posteriors.py` | 独立的离线意图后验比较，不参与在线实验。 |
 | `download_qwen3.py` | 本地 Hugging Face 模型下载辅助工具，与 Qwen API 无关。 |
@@ -29,6 +30,6 @@ tracev2 标准模板默认使用 Episode 44、200 步、一次重复、三个持
 
 ## 结果
 
-每次运行写入 `CWAH/experiments/` 下所选 `results_root` 的 `trace/` 或 `baseline/` 子目录。正常结果包括 `config.json`（生效配置与来源哈希）、`summary.json`（结果和指标）、`calls.jsonl`（逐调用指标）、`trajectory.pik`（逐步轨迹）及 `console.log`。异常中断可能保留检查点与 `.runtime/`。`calls.jsonl` 的调用或解析成功不等于任务完成，且不含模型正文。新轨迹可能包含服务返回的 `raw_chat_output` 和 `<think>`；旧轨迹已丢失的内容无法恢复。
+`results_root` 只指定实验集合目录；短名称如 `tmp_v1` 相对于 `CWAH/experiments/`。Runner 自动写入 `<results_root>/<供应商>/<模型_画像_步数>/<trace|baseline>/<模型_画像_步数_traceon|traceoff_时间戳>/`。供应商由模型 ID 识别为 `qwen`、`gpt`、`deepseek` 等；混用模型时归入 `mixed`。步数使用配置的 `max_episode_length`。每次运行保留 `config.json`、`summary.json`、`calls.jsonl`、`console.log` 和与运行目录同名的 `.pik` 轨迹文件；不足 50 步的失败或中断实验仍会保存。异常中断可能保留检查点与 `.runtime/`。`calls.jsonl` 的调用或解析成功不等于任务完成，且不含模型正文。新轨迹可能包含服务返回的 `raw_chat_output` 和 `<think>`；旧轨迹已丢失的内容无法恢复。
 
 私有 `.env.*`、本地 JSON、运行结果和锁文件不进 Git。`CWAH/virtualhome/`、`CWAH/executable/` 是外部本地依赖。算法与指标细节见仓库根目录的 `docs/TRACE_V2.md`、`docs/LLM_METRICS.md` 和 `docs/OFFLINE_INTENT_AGREEMENT.md`。

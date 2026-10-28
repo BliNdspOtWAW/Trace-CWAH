@@ -1,7 +1,9 @@
 import re
 import unittest
+from unittest.mock import patch
 from pathlib import Path
-from LLM.prompt_composer import compose_active, compose_reply
+from LLM.prompt_composer import (compose_active, compose_reply,
+                                 counterfactual_probe_prompt)
 from LLM.active_protocol import parse_trace_active
 
 ROOT = Path(__file__).resolve().parents[1] / 'LLM'
@@ -29,6 +31,29 @@ class PromptCompositionTests(unittest.TestCase):
         self.assertNotIn('**Additional teammate information:**', prompt)
         self.assertNotIn('$TEAMMATE_CONTEXT', prompt)
         self.assertNotIn('$OUTPUT_CONTRACT', prompt)
+
+    def test_counterfactual_probe_gate_uses_only_joint_intent_entropy(self):
+        for entropy, expected in ((0.85, False), (0.8501, True), (0.2, False)):
+            belief = ('{"intent":{"value":{"normalized_entropy":' + str(entropy)
+                      + '}},"uncertainty":{"uncertainty":1.0}}')
+            value, fragment = counterfactual_probe_prompt(belief, 'Alice')
+            self.assertEqual(value, entropy)
+            self.assertEqual(bool(fragment), expected)
+            if expected:
+                prompt = compose_active(self.template(), belief, fragment)
+                self.assertIn('Counterfactual Probe Check', prompt)
+                self.assertLess(prompt.index('TRACE Teammate Belief'),
+                                prompt.index('Counterfactual Probe Check'))
+                self.assertLess(prompt.index('Counterfactual Probe Check'),
+                                prompt.index('## Action Selection'))
+                self.assertEqual(prompt.count('Counterfactual Probe Check'), 1)
+            self.assertEqual(counterfactual_probe_prompt(belief, 'Bob'), (None, ''))
+        self.assertEqual(counterfactual_probe_prompt('{}', 'Alice'), (None, ''))
+
+    def test_counterfactual_probe_can_be_disabled_for_ablation(self):
+        belief = '{"intent":{"value":{"normalized_entropy":0.95}}}'
+        with patch.dict('os.environ', {'CWAH_DISABLE_COUNTERFACTUAL_PROBE': '1'}):
+            self.assertEqual(counterfactual_probe_prompt(belief, 'Alice'), (0.95, ''))
 
     def test_trace_examples_match_real_parser(self):
         prompt = compose_active(self.template(), 'TRACE-v2 teammate belief about Bob')

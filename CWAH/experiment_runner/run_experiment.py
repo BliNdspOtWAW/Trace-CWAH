@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from metric_reports import export_metrics
 from result_storage import finalize_artifacts, write_json
+from result_paths import run_parts
 
 
 TRACE_ROOT = Path(__file__).resolve().parents[2]
@@ -66,7 +67,8 @@ def resolve_results_root(value=None):
         return base
     if not isinstance(value, str) or not value.strip():
         raise ValueError('results_root must be a nonempty path string')
-    target = _path(value)
+    # A short folder name such as "tmp_v1" is relative to CWAH/experiments.
+    target = (base / value).resolve() if Path(value).parent == Path('.') else _path(value)
     try:
         target.relative_to(base)
     except ValueError as exc:
@@ -75,8 +77,11 @@ def resolve_results_root(value=None):
 
 
 def result_directory(selected, run_id):
-    category = 'trace' if selected['trace_mode'] == 'on' else 'baseline'
-    return Path(selected.get('results_root') or CWAH_ROOT / 'experiments') / category / run_id
+    provider, group, category, _ = run_parts(
+        selected['alice_model'], selected['bob_model'], selected['profile_id'],
+        selected['max_episode_length'], selected['trace_mode'], 'timestamp')
+    return (Path(selected.get('results_root') or CWAH_ROOT / 'experiments') /
+            provider / group / category / run_id)
 
 
 def validate(config):
@@ -246,6 +251,8 @@ def validate(config):
         raise ValueError("port must be 'auto' or an integer between 1 and 65535")
     return {
         "backend": backend, "local_model": local_options,
+        "alice_model": config['alice_model'], "bob_model": config['bob_model'],
+        "max_episode_length": config['max_episode_length'],
         "results_root": resolve_results_root(config["results_root"]) if config.get("results_root") is not None else None,
         "dataset": dataset,
         "dataset_size": len(episodes),
@@ -402,12 +409,14 @@ def _run_validated(config, selected, episode, index, port):
                    for role in ('alice', 'bob')}
     run_started = time.monotonic()
     profile_id = selected["profile_id"]
-    task_name = _label(str(episode["task_name"]))
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
-    label = f"_{selected['experiment_label']}" if selected["experiment_label"] else ""
-    continuous_label = "_continuous" if selected["continuous_subtasks"]["enabled"] else ""
-    run_id = (f"{task_name}_ep{index}_profile{profile_id}_trace-{selected['trace_mode']}"
-              f"{continuous_label}{label}_{timestamp}")
+    _, _, _, run_id = run_parts(
+        config['alice_model'], config['bob_model'], profile_id,
+        config['max_episode_length'], selected['trace_mode'], timestamp)
+    run_name_prefix = os.environ.get('CWAH_RUN_NAME_PREFIX', '')
+    if run_name_prefix and not re.fullmatch(r'[A-Za-z0-9_-]+', run_name_prefix):
+        raise ValueError('CWAH_RUN_NAME_PREFIX must contain only letters, numbers, _ or -')
+    run_id = run_name_prefix + run_id
     record_dir = result_directory(selected, run_id)
     record_dir.mkdir(parents=True, exist_ok=False)
     runtime_dir = record_dir / '.runtime'
@@ -457,7 +466,8 @@ def _run_validated(config, selected, episode, index, port):
             } for role in ('alice', 'bob')
         } if selected['backend'] == 'huggingface' else None,
         "run_id": run_id, "started_at": datetime.now().astimezone().isoformat(),
-        "results_root": str(record_dir.parent.parent),
+        "counterfactual_probe_disabled": os.environ.get('CWAH_DISABLE_COUNTERFACTUAL_PROBE') == '1',
+        "results_root": str(selected.get('results_root') or CWAH_ROOT / 'experiments'),
         "experiment_kind": "WAH episode with independent Bob profile; not a CollabBench Task 26 reproduction",
         "dataset_path": str(selected["dataset"]), "dataset_sha256": _sha256(selected["dataset"]),
         "episode_index": index, "task_id": episode["task_id"], "task_name": episode["task_name"],

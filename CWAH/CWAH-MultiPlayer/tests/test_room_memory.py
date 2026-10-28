@@ -47,3 +47,4 @@ class RoomMemoryTests(unittest.TestCase):
         self.assertEqual(actions[:2], [
             '[goexplore] <livingroom> (267)', '[goexplore] <kitchen> (11)',
         ])
+        self.assertEqual(actions[-1], '[wait]')

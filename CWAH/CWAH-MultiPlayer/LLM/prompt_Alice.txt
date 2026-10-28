@@ -63,7 +63,7 @@ $TEAMMATE_CONTEXT
 **Available high-level actions:**
 $ACTIONS_REFINE
 
-Select exactly one available action: a physical skill or [send_message].
+Select exactly one available action: a physical skill, [send_message], or [wait].
 
 Communication consumes one environment step, while physical skills often require multiple steps to complete. Compare the likely coordination benefit of a message with the progress you could make by acting directly. Use a message when it can resolve a decision-relevant question or improve the division of work; otherwise choose a useful physical action. Sending a message does not cancel an ongoing physical skill.
 

@@ -75,7 +75,7 @@ def finalize_artifacts(run_dir, episode_index, summary, exit_code, expected_runs
     status = 'completed' if completed else 'interrupted' if interrupted else 'failed'
     archive = {'format_version': 1, 'episode_index': episode_index,
                'runs': [records[k] for k in sorted(records)]}
-    target = run_dir / 'trajectory.pik'
+    target = run_dir / (run_dir.name + '.pik')
     temporary = target.with_name(target.name + '.tmp')
     with temporary.open('wb') as stream:
         pickle.dump(archive, stream, protocol=pickle.HIGHEST_PROTOCOL)
@@ -88,7 +88,7 @@ def finalize_artifacts(run_dir, episode_index, summary, exit_code, expected_runs
     del verified
     temporary.replace(target)
     summary.update(status=status, runner_exit_code=exit_code,
-                   trajectories=['trajectory.pik'], error=None)
+                   trajectories=[target.name], error=None)
     summary['recorded_runs'] = len(records)
     summary['steps_by_run'] = [{'run_index': k, 'steps': r.get('environment_steps', 0),
                               'partial': bool(r.get('partial') or r.get('interrupted'))}

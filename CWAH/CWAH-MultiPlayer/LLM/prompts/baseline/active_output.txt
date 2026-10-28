@@ -4,6 +4,8 @@ Output one available action and its associated <subtask_id>. Use an active publi
 
 For physical actions, leave <message> empty. For [send_message], provide a concise message. Keep all output fields at the top level; do not put control tags inside <cot> or <message>. Use the exact physical action text, including its object IDs and parameters, from the available list.
 
+Choose [wait] when there is no useful action or subtask to pursue this step. It consumes one environment step without moving or messaging. For [wait], use <subtask_id>null</subtask_id> and leave <message> empty.
+
 **Physical action:**
 <cot>Brief reason for the action.</cot>
 <message></message>
@@ -15,3 +17,9 @@ For physical actions, leave <message> empty. For [send_message], provide a conci
 <message>Concise message to your teammate.</message>
 <action>[send_message]</action>
 <subtask_id>Active task ID or null.</subtask_id>
+
+**No action this step:**
+<cot>Brief reason for waiting.</cot>
+<message></message>
+<action>[wait]</action>
+<subtask_id>null</subtask_id>
